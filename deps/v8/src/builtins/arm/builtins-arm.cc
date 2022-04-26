@@ -1034,8 +1034,8 @@ static void LoadTieringStateAndJumpIfNeedsProcessing(
     Label* has_optimized_code_or_state) {
   ASM_CODE_COMMENT(masm);
   DCHECK(!AreAliased(optimization_state, feedback_vector));
-  __ ldr(optimization_state,
-         FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
+  __ ldrh(optimization_state,
+          FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
   __ tst(
       optimization_state,
       Operand(FeedbackVector::kHasOptimizedCodeOrTieringStateIsAnyRequestMask));
@@ -1816,7 +1816,44 @@ void Generate_OSREntry(MacroAssembler* masm, Register entry_address,
   __ Ret();
 }
 
-void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
+enum class OsrSourceTier {
+  kInterpreter,
+  kBaseline,
+};
+
+void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
+                        Register current_loop_depth,
+                        Register encoded_current_bytecode_offset,
+                        Register osr_urgency_and_install_target) {
+  static constexpr Register scratch = r3;
+  DCHECK(!AreAliased(scratch, current_loop_depth,
+                     encoded_current_bytecode_offset,
+                     osr_urgency_and_install_target));
+  // OSR based on urgency, i.e. is the OSR urgency greater than the current
+  // loop depth?
+  Label try_osr;
+  STATIC_ASSERT(BytecodeArray::OsrUrgencyBits::kShift == 0);
+  Register urgency = scratch;
+  __ and_(urgency, osr_urgency_and_install_target,
+          Operand(BytecodeArray::OsrUrgencyBits::kMask));
+  __ cmp(urgency, current_loop_depth);
+  __ b(hi, &try_osr);
+
+  // OSR based on the install target offset, i.e. does the current bytecode
+  // offset match the install target offset?
+  static constexpr int kMask = BytecodeArray::OsrInstallTargetBits::kMask;
+  Register install_target = osr_urgency_and_install_target;
+  __ and_(install_target, osr_urgency_and_install_target, Operand(kMask));
+  __ cmp(install_target, encoded_current_bytecode_offset);
+  __ b(eq, &try_osr);
+
+  // Neither urgency nor the install target triggered, return to the caller.
+  // Note: the return value must be nullptr or a valid Code object.
+  __ Move(r0, Operand(0));
+  __ Ret(0);
+
+  __ bind(&try_osr);
+
   ASM_CODE_COMMENT(masm);
   {
     FrameAndConstantPoolScope scope(masm, StackFrame::INTERNAL);
@@ -1831,7 +1868,7 @@ void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
 
   __ bind(&skip);
 
-  if (is_interpreter) {
+  if (source == OsrSourceTier::kInterpreter) {
     // Drop the handler frame that is be sitting on top of the actual
     // JavaScript frame. This is the case then OSR is triggered from bytecode.
     __ LeaveFrame(StackFrame::STUB);
@@ -1857,13 +1894,24 @@ void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
 }  // namespace
 
 void Builtins::Generate_InterpreterOnStackReplacement(MacroAssembler* masm) {
-  return OnStackReplacement(masm, true);
+  using D = InterpreterOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+  OnStackReplacement(masm, OsrSourceTier::kInterpreter,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 
 void Builtins::Generate_BaselineOnStackReplacement(MacroAssembler* masm) {
+  using D = BaselineOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+
   __ ldr(kContextRegister,
          MemOperand(fp, BaselineFrameConstants::kContextOffset));
-  return OnStackReplacement(masm, false);
+  OnStackReplacement(masm, OsrSourceTier::kBaseline,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 
 // static
@@ -3535,10 +3583,6 @@ void Builtins::Generate_DeoptimizationEntry_Eager(MacroAssembler* masm) {
 
 void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
-}
-
-void Builtins::Generate_DeoptimizationEntry_Unused(MacroAssembler* masm) {
-  Generate_DeoptimizationEntry(masm, DeoptimizeKind::kUnused);
 }
 
 namespace {

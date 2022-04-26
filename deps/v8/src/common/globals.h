@@ -86,12 +86,16 @@ namespace internal {
 #endif
 
 // Helper macros to enable handling of direct C calls in the simulator.
-#if defined(USE_SIMULATOR) && defined(V8_TARGET_ARCH_ARM64)
+#if defined(USE_SIMULATOR) &&                                           \
+    (defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_MIPS64) || \
+     defined(V8_TARGET_ARCH_LOONG64))
 #define V8_USE_SIMULATOR_WITH_GENERIC_C_CALLS
 #define V8_IF_USE_SIMULATOR(V) , V
 #else
 #define V8_IF_USE_SIMULATOR(V)
-#endif  // defined(USE_SIMULATOR) && defined(V8_TARGET_ARCH_ARM64)
+#endif  // defined(USE_SIMULATOR) && \
+        // (defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_MIPS64) || \
+        // defined(V8_TARGET_ARCH_LOONG64))
 
 // Minimum stack size in KB required by compilers.
 constexpr int kStackSpaceRequiredForCompilation = 40;
@@ -522,13 +526,11 @@ constexpr int kNoDeoptimizationId = -1;
 // Deoptimize bailout kind:
 // - Eager: a check failed in the optimized code and deoptimization happens
 //   immediately.
-// - Unused: replaces "Soft" for ABI compatibility.
 // - Lazy: the code has been marked as dependent on some assumption which
 //   is checked elsewhere and can trigger deoptimization the next time the
 //   code is executed.
 enum class DeoptimizeKind : uint8_t {
   kEager,
-  kUnused,
   kLazy,
 };
 constexpr DeoptimizeKind kFirstDeoptimizeKind = DeoptimizeKind::kEager;
@@ -542,8 +544,6 @@ constexpr const char* ToString(DeoptimizeKind kind) {
   switch (kind) {
     case DeoptimizeKind::kEager:
       return "Eager";
-    case DeoptimizeKind::kUnused:
-      return "Unused";
     case DeoptimizeKind::kLazy:
       return "Lazy";
   }

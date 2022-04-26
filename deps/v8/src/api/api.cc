@@ -140,9 +140,13 @@
 
 #if V8_OS_LINUX || V8_OS_DARWIN || V8_OS_FREEBSD
 #include <signal.h>
+
+#if V8_ENABLE_WEBASSEMBLY
 #include "include/v8-wasm-trap-handler-posix.h"
 #include "src/trap-handler/handler-inside-posix.h"
-#endif
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+#endif  // V8_OS_LINUX || V8_OS_DARWIN || V8_OS_FREEBSD
 
 #if V8_OS_WIN
 #include <windows.h>
@@ -10032,20 +10036,20 @@ const char* CodeEvent::GetCodeEventTypeName(CodeEventType code_event_type) {
 
 CodeEventHandler::CodeEventHandler(Isolate* isolate) {
   internal_listener_ =
-      new i::ExternalCodeEventListener(reinterpret_cast<i::Isolate*>(isolate));
+      new i::ExternalLogEventListener(reinterpret_cast<i::Isolate*>(isolate));
 }
 
 CodeEventHandler::~CodeEventHandler() {
-  delete reinterpret_cast<i::ExternalCodeEventListener*>(internal_listener_);
+  delete reinterpret_cast<i::ExternalLogEventListener*>(internal_listener_);
 }
 
 void CodeEventHandler::Enable() {
-  reinterpret_cast<i::ExternalCodeEventListener*>(internal_listener_)
+  reinterpret_cast<i::ExternalLogEventListener*>(internal_listener_)
       ->StartListening(this);
 }
 
 void CodeEventHandler::Disable() {
-  reinterpret_cast<i::ExternalCodeEventListener*>(internal_listener_)
+  reinterpret_cast<i::ExternalLogEventListener*>(internal_listener_)
       ->StopListening();
 }
 

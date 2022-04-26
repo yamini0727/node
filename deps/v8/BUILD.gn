@@ -418,7 +418,7 @@ if (v8_enable_zone_compression == "") {
 }
 if (v8_enable_short_builtin_calls == "") {
   v8_enable_short_builtin_calls =
-      v8_current_cpu == "x64" || (!is_android && v8_current_cpu == "arm64")
+      v8_current_cpu == "x64" || v8_current_cpu == "arm64"
 }
 if (v8_enable_external_code_space == "") {
   v8_enable_external_code_space =
@@ -1786,7 +1786,7 @@ torque_files = [
   "src/objects/js-proxy.tq",
   "src/objects/js-regexp-string-iterator.tq",
   "src/objects/js-regexp.tq",
-  "src/objects/js-shadow-realms.tq",
+  "src/objects/js-shadow-realm.tq",
   "src/objects/js-struct.tq",
   "src/objects/js-temporal-objects.tq",
   "src/objects/js-weak-refs.tq",
@@ -2365,7 +2365,7 @@ v8_source_set("v8_initializers") {
     "src/builtins/builtins-proxy-gen.h",
     "src/builtins/builtins-regexp-gen.cc",
     "src/builtins/builtins-regexp-gen.h",
-    "src/builtins/builtins-shadowrealm-gen.cc",
+    "src/builtins/builtins-shadow-realm-gen.cc",
     "src/builtins/builtins-sharedarraybuffer-gen.cc",
     "src/builtins/builtins-string-gen.cc",
     "src/builtins/builtins-string-gen.h",
@@ -2750,6 +2750,8 @@ v8_header_set("v8_internal_headers") {
     "src/common/allow-deprecated.h",
     "src/common/assert-scope.h",
     "src/common/checks.h",
+    "src/common/code-memory-access-inl.h",
+    "src/common/code-memory-access.h",
     "src/common/high-allocation-throughput-scope.h",
     "src/common/message-template.h",
     "src/common/operation.h",
@@ -2874,6 +2876,12 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/simplified-operator.h",
     "src/compiler/state-values-utils.h",
     "src/compiler/store-store-elimination.h",
+    "src/compiler/turboshaft/assembler.h",
+    "src/compiler/turboshaft/deopt-data.h",
+    "src/compiler/turboshaft/graph-builder.h",
+    "src/compiler/turboshaft/graph.h",
+    "src/compiler/turboshaft/operations.h",
+    "src/compiler/turboshaft/recreate-schedule.h",
     "src/compiler/type-cache.h",
     "src/compiler/type-narrowing-reducer.h",
     "src/compiler/typed-optimization.h",
@@ -3207,8 +3215,8 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-regexp.h",
     "src/objects/js-segments-inl.h",
     "src/objects/js-segments.h",
-    "src/objects/js-shadow-realms-inl.h",
-    "src/objects/js-shadow-realms.h",
+    "src/objects/js-shadow-realm-inl.h",
+    "src/objects/js-shadow-realm.h",
     "src/objects/js-struct-inl.h",
     "src/objects/js-struct.h",
     "src/objects/js-temporal-objects-inl.h",
@@ -3513,6 +3521,7 @@ v8_header_set("v8_internal_headers") {
       "src/debug/debug-wasm-objects.h",
       "src/trap-handler/trap-handler-internal.h",
       "src/trap-handler/trap-handler.h",
+      "src/wasm/assembler-buffer-cache.h",
       "src/wasm/baseline/liftoff-assembler-defs.h",
       "src/wasm/baseline/liftoff-assembler.h",
       "src/wasm/baseline/liftoff-compiler.h",
@@ -4058,6 +4067,34 @@ v8_source_set("v8_compiler") {
   configs = [ ":internal_config" ]
 }
 
+# The src/compiler files with default optimization behavior.
+v8_source_set("v8_turboshaft") {
+  visibility = [ ":*" ]  # Only targets in this file can depend on this.
+
+  sources = [
+    "src/compiler/turboshaft/graph-builder.cc",
+    "src/compiler/turboshaft/graph.cc",
+    "src/compiler/turboshaft/operations.cc",
+    "src/compiler/turboshaft/recreate-schedule.cc",
+  ]
+
+  public_deps = [
+    ":generate_bytecode_builtins_list",
+    ":run_torque",
+    ":v8_internal_headers",
+    ":v8_maybe_icu",
+    ":v8_tracing",
+  ]
+
+  deps = [
+    ":v8_base_without_compiler",
+    ":v8_libbase",
+    ":v8_shared_internal_headers",
+  ]
+
+  configs = [ ":internal_config" ]
+}
+
 group("v8_compiler_for_mksnapshot") {
   if (is_debug && !v8_optimized_debug && v8_enable_fast_mksnapshot) {
     deps = [ ":v8_compiler_opt" ]
@@ -4122,7 +4159,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/builtins/builtins-object.cc",
     "src/builtins/builtins-reflect.cc",
     "src/builtins/builtins-regexp.cc",
-    "src/builtins/builtins-shadow-realms.cc",
+    "src/builtins/builtins-shadow-realm.cc",
     "src/builtins/builtins-sharedarraybuffer.cc",
     "src/builtins/builtins-string.cc",
     "src/builtins/builtins-struct.cc",
@@ -4131,6 +4168,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/builtins/builtins-trace.cc",
     "src/builtins/builtins-typed-array.cc",
     "src/builtins/builtins-weak-refs.cc",
+    "src/builtins/builtins-web-snapshots.cc",
     "src/builtins/builtins.cc",
     "src/builtins/constants-table-builder.cc",
     "src/codegen/aligned-slot-allocator.cc",
@@ -4163,6 +4201,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/codegen/turbo-assembler.cc",
     "src/codegen/unoptimized-compilation-info.cc",
     "src/common/assert-scope.cc",
+    "src/common/code-memory-access.cc",
     "src/compiler-dispatcher/lazy-compile-dispatcher.cc",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.cc",
     "src/date/date.cc",
@@ -4458,6 +4497,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/runtime/runtime-shadow-realm.cc",
     "src/runtime/runtime-strings.cc",
     "src/runtime/runtime-symbol.cc",
+    "src/runtime/runtime-temporal.cc",
     "src/runtime/runtime-test.cc",
     "src/runtime/runtime-trace.cc",
     "src/runtime/runtime-typedarray.cc",
@@ -4544,6 +4584,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/trap-handler/handler-inside.cc",
       "src/trap-handler/handler-outside.cc",
       "src/trap-handler/handler-shared.cc",
+      "src/wasm/assembler-buffer-cache.cc",
       "src/wasm/baseline/liftoff-assembler.cc",
       "src/wasm/baseline/liftoff-compiler.cc",
       "src/wasm/canonical-types.cc",
@@ -4966,6 +5007,7 @@ group("v8_base") {
   public_deps = [
     ":v8_base_without_compiler",
     ":v8_compiler",
+    ":v8_turboshaft",
   ]
 }
 
@@ -5101,7 +5143,6 @@ v8_component("v8_libbase") {
     "src/base/address-region.h",
     "src/base/atomic-utils.h",
     "src/base/atomicops.h",
-    "src/base/atomicops_internals_atomicword_compat.h",
     "src/base/base-export.h",
     "src/base/bit-field.h",
     "src/base/bits-iterator.h",
@@ -5243,6 +5284,7 @@ v8_component("v8_libbase") {
     sources += [
       "src/base/debug/stack_trace_posix.cc",
       "src/base/platform/platform-linux.cc",
+      "src/base/platform/platform-linux.h",
     ]
 
     libs = [
@@ -5874,6 +5916,7 @@ if (current_toolchain == v8_snapshot_toolchain) {
       ":v8_maybe_icu",
       ":v8_shared_internal_headers",
       ":v8_tracing",
+      ":v8_turboshaft",
       "//build/win:default_exe_manifest",
     ]
   }

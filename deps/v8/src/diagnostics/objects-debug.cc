@@ -54,7 +54,7 @@
 #endif  // V8_INTL_SUPPORT
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/js-regexp-string-iterator-inl.h"
-#include "src/objects/js-shadow-realms-inl.h"
+#include "src/objects/js-shadow-realm-inl.h"
 #ifdef V8_INTL_SUPPORT
 #include "src/objects/js-relative-time-format-inl.h"
 #include "src/objects/js-segment-iterator-inl.h"
@@ -665,7 +665,7 @@ void FeedbackMetadata::FeedbackMetadataVerify(Isolate* isolate) {
       iter.Next();
       FeedbackSlotKind kind = iter.kind();
       CHECK_NE(FeedbackSlotKind::kInvalid, kind);
-      CHECK_GT(FeedbackSlotKind::kKindsNumber, kind);
+      CHECK_GT(kFeedbackSlotKindCount, kind);
     }
   }
 }

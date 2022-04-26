@@ -69,7 +69,7 @@ class CompactInterpreterFrameState;
   V(Call)                  \
   V(Constant)              \
   V(InitialValue)          \
-  V(LoadField)             \
+  V(LoadTaggedField)       \
   V(LoadGlobal)            \
   V(LoadNamedGeneric)      \
   V(Phi)                   \
@@ -94,7 +94,9 @@ class CompactInterpreterFrameState;
 
 #define UNCONDITIONAL_CONTROL_NODE_LIST(V) \
   V(Jump)                                  \
-  V(JumpLoop)
+  V(JumpLoop)                              \
+  V(JumpToInlined)                         \
+  V(JumpFromInlined)
 
 #define CONTROL_NODE_LIST(V)       \
   V(Return)                        \
@@ -165,10 +167,7 @@ class ConditionalControlNode;
 class UnconditionalControlNode;
 class ValueNode;
 
-enum class ValueRepresentation {
-  kTagged,
-  kUntagged,
-};
+enum class ValueRepresentation : uint8_t { kTagged, kInt32, kFloat64 };
 
 #define DEF_FORWARD_DECLARATION(type, ...) class type;
 NODE_BASE_LIST(DEF_FORWARD_DECLARATION)
@@ -191,10 +190,9 @@ class OpProperties {
   constexpr bool non_memory_side_effects() const {
     return kNonMemorySideEffectsBit::decode(bitfield_);
   }
-  constexpr bool is_untagged_value() const {
-    return kUntaggedValueBit::decode(bitfield_);
+  constexpr ValueRepresentation value_representation() const {
+    return kValueRepresentationBits::decode(bitfield_);
   }
-
   constexpr bool is_pure() const {
     return (bitfield_ | kPureMask) == kPureValue;
   }
@@ -225,8 +223,17 @@ class OpProperties {
   static constexpr OpProperties NonMemorySideEffects() {
     return OpProperties(kNonMemorySideEffectsBit::encode(true));
   }
-  static constexpr OpProperties UntaggedValue() {
-    return OpProperties(kUntaggedValueBit::encode(true));
+  static constexpr OpProperties TaggedValue() {
+    return OpProperties(
+        kValueRepresentationBits::encode(ValueRepresentation::kTagged));
+  }
+  static constexpr OpProperties Int32() {
+    return OpProperties(
+        kValueRepresentationBits::encode(ValueRepresentation::kInt32));
+  }
+  static constexpr OpProperties Float64() {
+    return OpProperties(
+        kValueRepresentationBits::encode(ValueRepresentation::kFloat64));
   }
   static constexpr OpProperties JSCall() {
     return Call() | NonMemorySideEffects() | LazyDeopt();
@@ -245,7 +252,8 @@ class OpProperties {
   using kCanReadBit = kCanLazyDeoptBit::Next<bool, 1>;
   using kCanWriteBit = kCanReadBit::Next<bool, 1>;
   using kNonMemorySideEffectsBit = kCanWriteBit::Next<bool, 1>;
-  using kUntaggedValueBit = kNonMemorySideEffectsBit::Next<bool, 1>;
+  using kValueRepresentationBits =
+      kNonMemorySideEffectsBit::Next<ValueRepresentation, 2>;
 
   static const uint32_t kPureMask = kCanReadBit::kMask | kCanWriteBit::kMask |
                                     kNonMemorySideEffectsBit::kMask;
@@ -256,7 +264,7 @@ class OpProperties {
   const uint32_t bitfield_;
 
  public:
-  static const size_t kSize = kUntaggedValueBit::kLastUsedBit + 1;
+  static const size_t kSize = kValueRepresentationBits::kLastUsedBit + 1;
 };
 
 class ValueLocation {
@@ -287,10 +295,17 @@ class ValueLocation {
     operand_ = compiler::ConstantOperand(args...);
   }
 
-  Register AssignedRegister() const {
-    return Register::from_code(
-        compiler::AllocatedOperand::cast(operand_).register_code());
+  Register AssignedGeneralRegister() const {
+    DCHECK(!IsDoubleRegister());
+    return compiler::AllocatedOperand::cast(operand_).GetRegister();
   }
+
+  DoubleRegister AssignedDoubleRegister() const {
+    DCHECK(IsDoubleRegister());
+    return compiler::AllocatedOperand::cast(operand_).GetDoubleRegister();
+  }
+
+  bool IsDoubleRegister() const { return operand_.IsDoubleRegister(); }
 
   const compiler::InstructionOperand& operand() const { return operand_; }
   const compiler::InstructionOperand& operand() { return operand_; }
@@ -322,11 +337,15 @@ class CheckpointedInterpreterState {
  public:
   CheckpointedInterpreterState() = default;
   CheckpointedInterpreterState(BytecodeOffset bytecode_position,
-                               const CompactInterpreterFrameState* state)
-      : bytecode_position(bytecode_position), register_frame(state) {}
+                               const CompactInterpreterFrameState* state,
+                               const CheckpointedInterpreterState* parent)
+      : bytecode_position(bytecode_position),
+        register_frame(state),
+        parent(parent) {}
 
   BytecodeOffset bytecode_position = BytecodeOffset::None();
   const CompactInterpreterFrameState* register_frame = nullptr;
+  const CheckpointedInterpreterState* parent = nullptr;
 };
 
 class DeoptInfo {
@@ -335,10 +354,11 @@ class DeoptInfo {
             CheckpointedInterpreterState checkpoint);
 
  public:
+  const MaglevCompilationUnit& unit;
   CheckpointedInterpreterState state;
   InputLocation* input_locations = nullptr;
   Label deopt_entry_label;
-  int deopt_index = -1;
+  int translation_index = -1;
 };
 
 class EagerDeoptInfo : public DeoptInfo {
@@ -436,10 +456,11 @@ class NodeBase : public ZoneObject {
   }
 
   // Overwritten by subclasses.
-  static constexpr OpProperties kProperties = OpProperties::Pure();
+  static constexpr OpProperties kProperties =
+      OpProperties::Pure() | OpProperties::TaggedValue();
 
   constexpr Opcode opcode() const { return OpcodeField::decode(bit_field_); }
-  OpProperties properties() const {
+  constexpr OpProperties properties() const {
     return OpPropertiesField::decode(bit_field_);
   }
 
@@ -565,6 +586,16 @@ class NodeBase : public ZoneObject {
     new (input_address(index)) Input(input);
   }
 
+  // For nodes that don't have data past the input, allow trimming the input
+  // count. This is used by Phis to reduce inputs when merging in dead control
+  // flow.
+  void reduce_input_count() {
+    DCHECK_EQ(opcode(), Opcode::kPhi);
+    DCHECK(!properties().can_lazy_deopt());
+    DCHECK(!properties().can_eager_deopt());
+    bit_field_ = InputCountField::update(bit_field_, input_count() - 1);
+  }
+
   void set_temporaries_needed(int value) {
 #ifdef DEBUG
     DCHECK_EQ(kTemporariesState, kUnset);
@@ -659,18 +690,9 @@ constexpr bool NodeBase::Is<UnconditionalControlNode>() const {
 // The Node class hierarchy contains all non-control nodes.
 class Node : public NodeBase {
  public:
-  using List = base::ThreadedList<Node>;
+  using List = base::ThreadedListWithUnsafeInsertions<Node>;
 
   inline ValueLocation& result();
-
-  // This might break ThreadedList invariants.
-  // Run ThreadedList::RevalidateTail afterwards.
-  void AddNodeAfter(Node* node) {
-    DCHECK_NOT_NULL(node);
-    DCHECK_NULL(node->next_);
-    node->next_ = next_;
-    next_ = node;
-  }
 
   Node* NextNode() const { return next_; }
 
@@ -754,30 +776,64 @@ class ValueNode : public Node {
   // A node is dead once it has no more upcoming uses.
   bool is_dead() const { return next_use_ == kInvalidNodeId; }
 
-  void AddRegister(Register reg) { registers_with_result_.set(reg); }
-  void RemoveRegister(Register reg) { registers_with_result_.clear(reg); }
-  RegList ClearRegisters() {
-    return std::exchange(registers_with_result_, kEmptyRegList);
+  constexpr bool use_double_register() const {
+    return (properties().value_representation() ==
+            ValueRepresentation::kFloat64);
   }
 
-  int num_registers() const { return registers_with_result_.Count(); }
-  bool has_register() const { return registers_with_result_ != kEmptyRegList; }
+  constexpr MachineRepresentation GetMachineRepresentation() const {
+    switch (properties().value_representation()) {
+      case ValueRepresentation::kTagged:
+        return MachineRepresentation::kTagged;
+      case ValueRepresentation::kInt32:
+        return MachineRepresentation::kWord32;
+      case ValueRepresentation::kFloat64:
+        return MachineRepresentation::kFloat64;
+    }
+  }
+
+  void AddRegister(Register reg) {
+    DCHECK(!use_double_register());
+    registers_with_result_.set(reg);
+  }
+  void AddRegister(DoubleRegister reg) {
+    DCHECK(use_double_register());
+    double_registers_with_result_.set(reg);
+  }
+
+  void RemoveRegister(Register reg) {
+    DCHECK(!use_double_register());
+    registers_with_result_.clear(reg);
+  }
+  void RemoveRegister(DoubleRegister reg) {
+    DCHECK(use_double_register());
+    double_registers_with_result_.clear(reg);
+  }
+
+  template <typename T>
+  inline RegListBase<T> ClearRegisters();
+
+  int num_registers() const {
+    if (use_double_register()) {
+      return double_registers_with_result_.Count();
+    }
+    return registers_with_result_.Count();
+  }
+  bool has_register() const {
+    if (use_double_register()) {
+      return double_registers_with_result_ != kEmptyDoubleRegList;
+    }
+    return registers_with_result_ != kEmptyRegList;
+  }
 
   compiler::AllocatedOperand allocation() const {
     if (has_register()) {
       return compiler::AllocatedOperand(compiler::LocationOperand::REGISTER,
-                                        MachineRepresentation::kTagged,
-                                        registers_with_result_.first().code());
+                                        GetMachineRepresentation(),
+                                        FirstRegisterCode());
     }
     DCHECK(is_spilled());
     return compiler::AllocatedOperand::cast(spill_or_hint_);
-  }
-
-  bool is_untagged_value() const { return properties().is_untagged_value(); }
-
-  ValueRepresentation value_representation() const {
-    return is_untagged_value() ? ValueRepresentation::kUntagged
-                               : ValueRepresentation::kTagged;
   }
 
  protected:
@@ -789,6 +845,18 @@ class ValueNode : public Node {
         state_(kLastUse)
 #endif  // DEBUG
   {
+    if (use_double_register()) {
+      double_registers_with_result_ = kEmptyDoubleRegList;
+    } else {
+      registers_with_result_ = kEmptyRegList;
+    }
+  }
+
+  int FirstRegisterCode() const {
+    if (use_double_register()) {
+      return double_registers_with_result_.first().code();
+    }
+    return registers_with_result_.first().code();
   }
 
   // Rename for better pairing with `end_id`.
@@ -797,7 +865,10 @@ class ValueNode : public Node {
   NodeIdT end_id_ = kInvalidNodeId;
   NodeIdT next_use_ = kInvalidNodeId;
   ValueLocation result_;
-  RegList registers_with_result_ = kEmptyRegList;
+  union {
+    RegList registers_with_result_;
+    DoubleRegList double_registers_with_result_;
+  };
   union {
     // Pointer to the current last use's next_use_id field. Most of the time
     // this will be a pointer to an Input's next_use_id_ field, but it's
@@ -810,6 +881,18 @@ class ValueNode : public Node {
   enum { kLastUse, kSpillOrHint } state_;
 #endif  // DEBUG
 };
+
+template <>
+inline RegList ValueNode::ClearRegisters() {
+  DCHECK(!use_double_register());
+  return std::exchange(registers_with_result_, kEmptyRegList);
+}
+
+template <>
+inline DoubleRegList ValueNode::ClearRegisters() {
+  DCHECK(use_double_register());
+  return std::exchange(double_registers_with_result_, kEmptyDoubleRegList);
+}
 
 ValueLocation& Node::result() {
   DCHECK(Is<ValueNode>());
@@ -975,7 +1058,7 @@ class CheckedSmiUntag : public FixedInputValueNodeT<1, CheckedSmiUntag> {
   explicit CheckedSmiUntag(uint32_t bitfield) : Base(bitfield) {}
 
   static constexpr OpProperties kProperties =
-      OpProperties::EagerDeopt() | OpProperties::UntaggedValue();
+      OpProperties::EagerDeopt() | OpProperties::Int32();
 
   Input& input() { return Node::input(0); }
 
@@ -991,7 +1074,7 @@ class Int32Constant : public FixedInputValueNodeT<0, Int32Constant> {
   explicit Int32Constant(uint32_t bitfield, int32_t value)
       : Base(bitfield), value_(value) {}
 
-  static constexpr OpProperties kProperties = OpProperties::UntaggedValue();
+  static constexpr OpProperties kProperties = OpProperties::Int32();
 
   int32_t value() const { return value_; }
 
@@ -1011,7 +1094,7 @@ class Int32AddWithOverflow
   explicit Int32AddWithOverflow(uint32_t bitfield) : Base(bitfield) {}
 
   static constexpr OpProperties kProperties =
-      OpProperties::EagerDeopt() | OpProperties::UntaggedValue();
+      OpProperties::EagerDeopt() | OpProperties::Int32();
 
   static constexpr int kLeftIndex = 0;
   static constexpr int kRightIndex = 1;
@@ -1132,16 +1215,16 @@ class CheckMaps : public FixedInputNodeT<1, CheckMaps> {
   const compiler::MapRef map_;
 };
 
-class LoadField : public FixedInputValueNodeT<1, LoadField> {
-  using Base = FixedInputValueNodeT<1, LoadField>;
+class LoadTaggedField : public FixedInputValueNodeT<1, LoadTaggedField> {
+  using Base = FixedInputValueNodeT<1, LoadTaggedField>;
 
  public:
-  explicit LoadField(uint32_t bitfield, int handler)
-      : Base(bitfield), handler_(handler) {}
+  explicit LoadTaggedField(uint32_t bitfield, int offset)
+      : Base(bitfield), offset_(offset) {}
 
   static constexpr OpProperties kProperties = OpProperties::Reading();
 
-  int handler() const { return handler_; }
+  int offset() const { return offset_; }
 
   static constexpr int kObjectIndex = 0;
   Input& object_input() { return input(kObjectIndex); }
@@ -1151,7 +1234,7 @@ class LoadField : public FixedInputValueNodeT<1, LoadField> {
   void PrintParams(std::ostream&, MaglevGraphLabeller*) const;
 
  private:
-  const int handler_;
+  const int offset_;
 };
 
 class StoreField : public FixedInputNodeT<2, StoreField> {
@@ -1263,6 +1346,7 @@ class Phi : public ValueNodeT<Phi> {
   interpreter::Register owner() const { return owner_; }
   int merge_offset() const { return merge_offset_; }
 
+  using Node::reduce_input_count;
   using Node::set_input;
 
   void AllocateVreg(MaglevVregAllocationState*, const ProcessingState&);
@@ -1423,9 +1507,9 @@ class ControlNode : public NodeBase {
     return next_post_dominating_hole_;
   }
   void set_next_post_dominating_hole(ControlNode* node) {
-    DCHECK_IMPLIES(node != nullptr, node->Is<Jump>() || node->Is<Return>() ||
-                                        node->Is<Deopt>() ||
-                                        node->Is<JumpLoop>());
+    DCHECK_IMPLIES(node != nullptr, node->Is<UnconditionalControlNode>() ||
+                                        node->Is<Return>() ||
+                                        node->Is<Deopt>());
     next_post_dominating_hole_ = node;
   }
 
@@ -1543,6 +1627,36 @@ class JumpLoop : public UnconditionalControlNodeT<JumpLoop> {
 
   explicit JumpLoop(uint32_t bitfield, BasicBlockRef* ref)
       : Base(bitfield, ref) {}
+
+  void AllocateVreg(MaglevVregAllocationState*, const ProcessingState&);
+  void GenerateCode(MaglevCodeGenState*, const ProcessingState&);
+  void PrintParams(std::ostream&, MaglevGraphLabeller*) const {}
+};
+
+class JumpToInlined : public UnconditionalControlNodeT<JumpToInlined> {
+  using Base = UnconditionalControlNodeT<JumpToInlined>;
+
+ public:
+  explicit JumpToInlined(uint32_t bitfield, BasicBlockRef* target_refs,
+                         MaglevCompilationUnit* unit)
+      : Base(bitfield, target_refs), unit_(unit) {}
+
+  void AllocateVreg(MaglevVregAllocationState*, const ProcessingState&);
+  void GenerateCode(MaglevCodeGenState*, const ProcessingState&);
+  void PrintParams(std::ostream&, MaglevGraphLabeller*) const;
+
+  const MaglevCompilationUnit* unit() const { return unit_; }
+
+ private:
+  MaglevCompilationUnit* unit_;
+};
+
+class JumpFromInlined : public UnconditionalControlNodeT<JumpFromInlined> {
+  using Base = UnconditionalControlNodeT<JumpFromInlined>;
+
+ public:
+  explicit JumpFromInlined(uint32_t bitfield, BasicBlockRef* target_refs)
+      : Base(bitfield, target_refs) {}
 
   void AllocateVreg(MaglevVregAllocationState*, const ProcessingState&);
   void GenerateCode(MaglevCodeGenState*, const ProcessingState&);

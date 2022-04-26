@@ -52,7 +52,7 @@
 #endif  // V8_INTL_SUPPORT
 #include "src/objects/js-regexp-string-iterator.h"
 #include "src/objects/js-regexp.h"
-#include "src/objects/js-shadow-realms.h"
+#include "src/objects/js-shadow-realm.h"
 #ifdef V8_INTL_SUPPORT
 #include "src/objects/js-relative-time-format.h"
 #include "src/objects/js-segment-iterator.h"
@@ -238,6 +238,8 @@ class Genesis {
   HARMONY_SHIPPING(DECLARE_FEATURE_INITIALIZATION)
 #undef DECLARE_FEATURE_INITIALIZATION
   void InitializeGlobal_regexp_linear_flag();
+
+  void InitializeGlobal_experimental_web_snapshots();
 
   enum ArrayBufferKind { ARRAY_BUFFER, SHARED_ARRAY_BUFFER };
   Handle<JSFunction> CreateArrayBuffer(Handle<String> name,
@@ -965,20 +967,6 @@ void Genesis::CreateIteratorMaps(Handle<JSFunction> empty) {
     async_module_evaluate_internal->shared().set_native(false);
     native_context()->set_async_module_evaluate_internal(
         *async_module_evaluate_internal);
-
-    Handle<JSFunction> call_async_module_fulfilled =
-        SimpleCreateFunction(isolate(), factory()->empty_string(),
-                             Builtin::kCallAsyncModuleFulfilled, 1, false);
-    call_async_module_fulfilled->shared().set_native(false);
-    native_context()->set_call_async_module_fulfilled(
-        *call_async_module_fulfilled);
-
-    Handle<JSFunction> call_async_module_rejected =
-        SimpleCreateFunction(isolate(), factory()->empty_string(),
-                             Builtin::kCallAsyncModuleRejected, 1, false);
-    call_async_module_rejected->shared().set_native(false);
-    native_context()->set_call_async_module_rejected(
-        *call_async_module_rejected);
   }
 
   // Create maps for generator functions and their prototypes.  Store those
@@ -4117,6 +4105,7 @@ void Genesis::InitializeExperimentalGlobal() {
   HARMONY_INPROGRESS(FEATURE_INITIALIZE_GLOBAL)
 #undef FEATURE_INITIALIZE_GLOBAL
   InitializeGlobal_regexp_linear_flag();
+  InitializeGlobal_experimental_web_snapshots();
 }
 
 bool Genesis::CompileExtension(Isolate* isolate, v8::Extension* extension) {
@@ -4550,6 +4539,17 @@ void Genesis::InitializeGlobal_harmony_shadow_realm() {
     }
 
     native_context()->set_wrapped_function_map(*map);
+  }
+
+  // Internal steps of ShadowRealmImportValue
+  {
+    Handle<JSFunction> shadow_realm_import_value_rejected =
+        SimpleCreateFunction(isolate(), factory->empty_string(),
+                             Builtin::kShadowRealmImportValueRejected, 1,
+                             false);
+    shadow_realm_import_value_rejected->shared().set_native(false);
+    native_context()->set_shadow_realm_import_value_rejected(
+        *shadow_realm_import_value_rejected);
   }
 }
 
@@ -5448,6 +5448,21 @@ void Genesis::InitializeGlobal_harmony_intl_number_format_v3() {
 }
 
 #endif  // V8_INTL_SUPPORT
+
+void Genesis::InitializeGlobal_experimental_web_snapshots() {
+  if (!FLAG_experimental_web_snapshots) return;
+
+  Handle<JSGlobalObject> global(native_context()->global_object(), isolate());
+  Handle<JSObject> web_snapshot_object =
+      factory()->NewJSObject(isolate_->object_function(), AllocationType::kOld);
+  JSObject::AddProperty(isolate_, global, "WebSnapshot", web_snapshot_object,
+                        DONT_ENUM);
+  InstallToStringTag(isolate_, web_snapshot_object, "WebSnapshot");
+  SimpleInstallFunction(isolate_, web_snapshot_object, "serialize",
+                        Builtin::kWebSnapshotSerialize, 2, false);
+  SimpleInstallFunction(isolate_, web_snapshot_object, "deserialize",
+                        Builtin::kWebSnapshotDeserialize, 2, false);
+}
 
 Handle<JSFunction> Genesis::CreateArrayBuffer(
     Handle<String> name, ArrayBufferKind array_buffer_kind) {

@@ -2113,6 +2113,11 @@ bool InstructionSelector::ZeroExtendsWord32ToWord64NoPhis(Node* node) {
   UNIMPLEMENTED();
 }
 
+void InstructionSelector::EmitMoveParamToFPR(Node* node, int index) {}
+
+void InstructionSelector::EmitMoveFPRToParam(InstructionOperand* op,
+                                             LinkageLocation location) {}
+
 void InstructionSelector::EmitPrepareArguments(
     ZoneVector<PushParameter>* arguments, const CallDescriptor* call_descriptor,
     Node* node) {
@@ -2543,8 +2548,6 @@ void InstructionSelector::VisitWord64AtomicStore(Node* node) {
   V(F64x2Splat)              \
   V(F32x4Abs)                \
   V(F32x4Neg)                \
-  V(F32x4RecipApprox)        \
-  V(F32x4RecipSqrtApprox)    \
   V(F32x4Sqrt)               \
   V(F32x4Ceil)               \
   V(F32x4Floor)              \

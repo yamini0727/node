@@ -20,11 +20,9 @@
 ['system == macos and arch == arm64 and not simulator_run', {
   # Throwing C++ exceptions doesn't work; probably because the unittests
   # binary is built with -fno-exceptions?
-  'LanguageServerJson.LexerError': [SKIP],
-  'LanguageServerJson.ParserError': [SKIP],
-  'Torque.DoubleUnderScorePrefixIllegalForIdentifiers': [SKIP],
-  'Torque.Enums': [SKIP],
-  'Torque.ImportNonExistentFile': [SKIP],
+  'LanguageServerJson.*': [SKIP],
+  'LanguageServer.*': [SKIP],
+  'Torque.*': [SKIP],
 
   # Test uses fancy signal handling. Needs investigation.
   'MemoryAllocationPermissionsTest.DoTest': [SKIP],
@@ -34,6 +32,11 @@
   'RuntimeCallStatsTest.BasicJavaScript': [SKIP],
   'RuntimeCallStatsTest.FunctionLengthGetter': [SKIP],
 }],  # system == macos and arch == arm64 and not simulator_run
+
+# TODO(v8:12824): Enable this test once this is resolved.
+['arch == arm64 and msan', {
+  'WeakContainerTest.ConservativeGCTracesWeakContainer': [SKIP],
+}],  # arch == arm64 and msan
 
 ##############################################################################
 # TODO(v8:7777): Change this once wasm is supported in jitless mode.

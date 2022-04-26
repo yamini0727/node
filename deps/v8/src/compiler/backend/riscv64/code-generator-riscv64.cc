@@ -2074,9 +2074,9 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     }
     case kRiscvS128AndNot: {
       (__ VU).set(kScratchReg, VSew::E8, Vlmul::m1);
-      __ vnot_vv(i.OutputSimd128Register(), i.InputSimd128Register(1));
+      __ vnot_vv(kSimd128ScratchReg, i.InputSimd128Register(1));
       __ vand_vv(i.OutputSimd128Register(), i.InputSimd128Register(0),
-                 i.OutputSimd128Register());
+                 kSimd128ScratchReg);
       break;
     }
     case kRiscvS128Const: {
@@ -3173,16 +3173,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ vfmin_vv(kSimd128ScratchReg, i.InputSimd128Register(1),
                   i.InputSimd128Register(0), Mask);
       __ vmv_vv(i.OutputSimd128Register(), kSimd128ScratchReg);
-      break;
-    }
-    case kRiscvF32x4RecipApprox: {
-      __ VU.set(kScratchReg, E32, m1);
-      __ vfrec7_v(i.OutputSimd128Register(), i.InputSimd128Register(0));
-      break;
-    }
-    case kRiscvF32x4RecipSqrtApprox: {
-      __ VU.set(kScratchReg, E32, m1);
-      __ vfrsqrt7_v(i.OutputSimd128Register(), i.InputSimd128Register(0));
       break;
     }
     case kRiscvF32x4Qfma: {

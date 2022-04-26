@@ -4,6 +4,7 @@
 
 #include "src/heap/mark-compact.h"
 
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -517,11 +518,12 @@ void MarkCompactCollector::TearDown() {
 }
 
 // static
-bool MarkCompactCollector::IsMapOrForwardedMap(Map map) {
+bool MarkCompactCollector::IsMapOrForwarded(Map map) {
   MapWord map_word = map.map_word(kRelaxedLoad);
 
   if (map_word.IsForwardingAddress()) {
-    return map_word.ToForwardingAddress().IsMap();
+    // During GC we can't access forwarded maps without synchronization.
+    return true;
   } else {
     return map_word.ToMap().IsMap();
   }
@@ -1048,6 +1050,8 @@ void MarkCompactCollector::VerifyMarking() {
 void MarkCompactCollector::Finish() {
   TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_FINISH);
 
+  heap()->isolate()->global_handles()->ClearListOfYoungNodes();
+
   SweepArrayBufferExtensions();
 
 #ifdef DEBUG
@@ -1313,10 +1317,9 @@ class MarkCompactCollector::SharedHeapObjectVisitor final
   MarkCompactCollector* const collector_;
 };
 
-class InternalizedStringTableCleaner : public RootVisitor {
+class InternalizedStringTableCleaner final : public RootVisitor {
  public:
-  explicit InternalizedStringTableCleaner(Heap* heap)
-      : heap_(heap), pointers_removed_(0) {}
+  explicit InternalizedStringTableCleaner(Heap* heap) : heap_(heap) {}
 
   void VisitRootPointers(Root root, const char* description,
                          FullObjectSlot start, FullObjectSlot end) override {
@@ -1328,8 +1331,7 @@ class InternalizedStringTableCleaner : public RootVisitor {
                          OffHeapObjectSlot end) override {
     DCHECK_EQ(root, Root::kStringTable);
     // Visit all HeapObject pointers in [start, end).
-    MarkCompactCollector::NonAtomicMarkingState* marking_state =
-        heap_->mark_compact_collector()->non_atomic_marking_state();
+    auto* marking_state = heap_->mark_compact_collector()->marking_state();
     Isolate* isolate = heap_->isolate();
     for (OffHeapObjectSlot p = start; p < end; ++p) {
       Object o = p.load(isolate);
@@ -1345,11 +1347,11 @@ class InternalizedStringTableCleaner : public RootVisitor {
     }
   }
 
-  int PointersRemoved() { return pointers_removed_; }
+  int PointersRemoved() const { return pointers_removed_; }
 
  private:
   Heap* heap_;
-  int pointers_removed_;
+  int pointers_removed_ = 0;
 };
 
 class ExternalStringTableCleaner : public RootVisitor {
@@ -1389,7 +1391,7 @@ class ExternalStringTableCleaner : public RootVisitor {
 class MarkCompactWeakObjectRetainer : public WeakObjectRetainer {
  public:
   explicit MarkCompactWeakObjectRetainer(
-      MarkCompactCollector::NonAtomicMarkingState* marking_state)
+      MarkCompactCollector::MarkingState* marking_state)
       : marking_state_(marking_state) {}
 
   Object RetainAs(Object object) override {
@@ -1419,7 +1421,7 @@ class MarkCompactWeakObjectRetainer : public WeakObjectRetainer {
   }
 
  private:
-  MarkCompactCollector::NonAtomicMarkingState* marking_state_;
+  MarkCompactCollector::MarkingState* const marking_state_;
 };
 
 class RecordMigratedSlotVisitor : public ObjectVisitorWithCageBases {
@@ -2440,47 +2442,6 @@ void MarkCompactCollector::MarkLiveObjects() {
       ProcessEphemeronMarking();
       DCHECK(local_marking_worklists()->IsEmpty());
     }
-
-    // The objects reachable from the roots, weak maps, and embedder heap
-    // tracing are marked. Objects pointed to only by weak global handles cannot
-    // be immediately reclaimed. Instead, we have to mark them as pending and
-    // mark objects reachable from them.
-    //
-    // First we identify nonlive weak handles and mark them as pending
-    // destruction.
-    {
-      TRACE_GC(heap()->tracer(),
-               GCTracer::Scope::MC_MARK_WEAK_CLOSURE_WEAK_HANDLES);
-      heap()->isolate()->global_handles()->IterateWeakRootsIdentifyFinalizers(
-          &IsUnmarkedHeapObject);
-      DrainMarkingWorklist();
-    }
-
-    // Process finalizers, effectively keeping them alive until the next
-    // garbage collection.
-    {
-      TRACE_GC(heap()->tracer(),
-               GCTracer::Scope::MC_MARK_WEAK_CLOSURE_WEAK_ROOTS);
-      heap()->isolate()->global_handles()->IterateWeakRootsForFinalizers(
-          &root_visitor);
-      DrainMarkingWorklist();
-    }
-
-    // Repeat ephemeron processing from the newly marked objects.
-    {
-      TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_MARK_WEAK_CLOSURE_HARMONY);
-      ProcessEphemeronMarking();
-      DCHECK(local_marking_worklists()->IsWrapperEmpty());
-      DCHECK(local_marking_worklists()->IsEmpty());
-    }
-
-    // We depend on IterateWeakRootsForPhantomHandles being called before
-    // ProcessOldCodeCandidates in order to identify flushed bytecode in the
-    // CPU profiler.
-    {
-      heap()->isolate()->global_handles()->IterateWeakRootsForPhantomHandles(
-          &IsUnmarkedHeapObject);
-    }
   }
 
   if (was_marked_incrementally) {
@@ -2494,31 +2455,103 @@ void MarkCompactCollector::MarkLiveObjects() {
   epoch_++;
 }
 
+namespace {
+
+class ParallelClearingJob final : public v8::JobTask {
+ public:
+  class ClearingItem {
+   public:
+    virtual ~ClearingItem() = default;
+    virtual void Run(JobDelegate* delegate) = 0;
+  };
+
+  ParallelClearingJob() = default;
+  ~ParallelClearingJob() override = default;
+  ParallelClearingJob(const ParallelClearingJob&) = delete;
+  ParallelClearingJob& operator=(const ParallelClearingJob&) = delete;
+
+  // v8::JobTask overrides.
+  void Run(JobDelegate* delegate) override {
+    std::unique_ptr<ClearingItem> item;
+    {
+      base::MutexGuard guard(&items_mutex_);
+      item = std::move(items_.back());
+      items_.pop_back();
+    }
+    item->Run(delegate);
+  }
+
+  size_t GetMaxConcurrency(size_t worker_count) const override {
+    base::MutexGuard guard(&items_mutex_);
+    return items_.size();
+  }
+
+  void Add(std::unique_ptr<ClearingItem> item) {
+    items_.push_back(std::move(item));
+  }
+
+ private:
+  mutable base::Mutex items_mutex_;
+  std::vector<std::unique_ptr<ClearingItem>> items_;
+};
+
+class ClearStringTableJobItem final : public ParallelClearingJob::ClearingItem {
+ public:
+  explicit ClearStringTableJobItem(Isolate* isolate) : isolate_(isolate) {}
+
+  void Run(JobDelegate* delegate) final {
+    if (isolate_->OwnsStringTable()) {
+      TRACE_GC1(isolate_->heap()->tracer(),
+                GCTracer::Scope::MC_CLEAR_STRING_TABLE,
+                delegate->IsJoiningThread() ? ThreadKind::kMain
+                                            : ThreadKind::kBackground);
+      // Prune the string table removing all strings only pointed to by the
+      // string table.  Cannot use string_table() here because the string
+      // table is marked.
+      StringTable* string_table = isolate_->string_table();
+      InternalizedStringTableCleaner internalized_visitor(isolate_->heap());
+      string_table->DropOldData();
+      string_table->IterateElements(&internalized_visitor);
+      string_table->NotifyElementsRemoved(
+          internalized_visitor.PointersRemoved());
+    }
+  }
+
+ private:
+  Isolate* const isolate_;
+};
+
+}  // namespace
+
 void MarkCompactCollector::ClearNonLiveReferences() {
   TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR);
 
-  if (isolate()->OwnsStringTable()) {
-    TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_STRING_TABLE);
+  auto clearing_job = std::make_unique<ParallelClearingJob>();
+  clearing_job->Add(std::make_unique<ClearStringTableJobItem>(isolate()));
+  auto clearing_job_handle = V8::GetCurrentPlatform()->PostJob(
+      TaskPriority::kUserBlocking, std::move(clearing_job));
 
-    // Prune the string table removing all strings only pointed to by the
-    // string table.  Cannot use string_table() here because the string
-    // table is marked.
-    StringTable* string_table = isolate()->string_table();
-    InternalizedStringTableCleaner internalized_visitor(heap());
-    string_table->DropOldData();
-    string_table->IterateElements(&internalized_visitor);
-    string_table->NotifyElementsRemoved(internalized_visitor.PointersRemoved());
+  {
+    TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_EXTERNAL_STRING_TABLE);
+    ExternalStringTableCleaner external_visitor(heap());
+    heap()->external_string_table_.IterateAll(&external_visitor);
+    heap()->external_string_table_.CleanUpAll();
   }
 
-  ExternalStringTableCleaner external_visitor(heap());
-  heap()->external_string_table_.IterateAll(&external_visitor);
-  heap()->external_string_table_.CleanUpAll();
+  {
+    TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_WEAK_GLOBAL_HANDLES);
+    // We depend on `IterateWeakRootsForPhantomHandles()` being called before
+    // `ProcessOldCodeCandidates()` in order to identify flushed bytecode in the
+    // CPU profiler.
+    heap()->isolate()->global_handles()->IterateWeakRootsForPhantomHandles(
+        &IsUnmarkedHeapObject);
+  }
 
   {
     TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_FLUSHABLE_BYTECODE);
-    // ProcessFlusheBaselineCandidates should be called after clearing bytecode
-    // so that we flush any bytecode if needed so we could correctly set the
-    // code object on the JSFunction.
+    // `ProcessFlusheBaselineCandidates()` must be called after
+    // `ProcessOldCodeCandidates()` so that we correctly set the code object on
+    // the JSFunction after flushing.
     ProcessOldCodeCandidates();
     ProcessFlushedBaselineCandidates();
   }
@@ -2531,8 +2564,7 @@ void MarkCompactCollector::ClearNonLiveReferences() {
   {
     TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_WEAK_LISTS);
     // Process the weak references.
-    MarkCompactWeakObjectRetainer mark_compact_object_retainer(
-        non_atomic_marking_state());
+    MarkCompactWeakObjectRetainer mark_compact_object_retainer(marking_state());
     heap()->ProcessAllWeakReferences(&mark_compact_object_retainer);
   }
 
@@ -2560,6 +2592,11 @@ void MarkCompactCollector::ClearNonLiveReferences() {
     isolate()->external_pointer_table().Sweep(isolate());
   }
 #endif  // V8_SANDBOXED_EXTERNAL_POINTERS
+
+  {
+    TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_CLEAR_JOIN_JOB);
+    clearing_job_handle->Join();
+  }
 
   DCHECK(weak_objects_.transition_arrays.IsEmpty());
   DCHECK(weak_objects_.weak_references.IsEmpty());
@@ -2675,8 +2712,8 @@ void MarkCompactCollector::FlushBytecodeFromSFI(
 
   // Mark the uncompiled data as black, and ensure all fields have already been
   // marked.
-  DCHECK(non_atomic_marking_state()->IsBlackOrGrey(inferred_name));
-  non_atomic_marking_state()->WhiteToBlack(uncompiled_data);
+  DCHECK(marking_state()->IsBlackOrGrey(inferred_name));
+  marking_state()->WhiteToBlack(uncompiled_data);
 
   // Use the raw function data setter to avoid validity checks, since we're
   // performing the unusual task of decompiling.
@@ -3231,7 +3268,7 @@ static inline SlotCallbackResult UpdateSlot(PtrComprCageBase cage_base,
     DCHECK(!Heap::InFromPage(target));
     DCHECK(!MarkCompactCollector::IsOnEvacuationCandidate(target));
   } else {
-    DCHECK(MarkCompactCollector::IsMapOrForwardedMap(map_word.ToMap()));
+    DCHECK(MarkCompactCollector::IsMapOrForwarded(map_word.ToMap()));
   }
   return REMOVE_SLOT;
 }
@@ -3513,7 +3550,7 @@ void MarkCompactCollector::EvacuateEpilogue() {
     heap()->new_lo_space()->FreeUnmarkedObjects();
   }
 
-  // Old space. Deallocate evacuated candidate pages.
+  // Old generation. Deallocate evacuated candidate pages.
   ReleaseEvacuationCandidates();
 
   // Give pages that are queued to be freed back to the OS.
@@ -3527,10 +3564,16 @@ void MarkCompactCollector::EvacuateEpilogue() {
 
     // Old-to-old slot sets must be empty after evacuation.
     DCHECK_NULL((chunk->slot_set<OLD_TO_OLD, AccessMode::ATOMIC>()));
-    DCHECK_NULL((chunk->slot_set<OLD_TO_SHARED, AccessMode::NON_ATOMIC>()));
     DCHECK_NULL((chunk->typed_slot_set<OLD_TO_OLD, AccessMode::ATOMIC>()));
+
+    // Old-to-new slot sets must be empty after evacuation.
+    DCHECK_NULL((chunk->slot_set<OLD_TO_NEW, AccessMode::ATOMIC>()));
+    DCHECK_NULL((chunk->typed_slot_set<OLD_TO_NEW, AccessMode::ATOMIC>()));
+
+    // GCs need to filter invalidated slots.
     DCHECK_NULL(chunk->invalidated_slots<OLD_TO_OLD>());
     DCHECK_NULL(chunk->invalidated_slots<OLD_TO_NEW>());
+    DCHECK_NULL(chunk->invalidated_slots<OLD_TO_SHARED>());
   }
 #endif
 }
@@ -4451,6 +4494,21 @@ class RememberedSetUpdatingItem : public UpdatingItem {
       // processsed, but since there are no invalidated OLD_TO_CODE slots,
       // there's nothing to clear.
     }
+    if (updating_mode_ == RememberedSetUpdatingMode::ALL) {
+      if (chunk_->slot_set<OLD_TO_SHARED, AccessMode::NON_ATOMIC>()) {
+        // Client GCs need to remove invalidated OLD_TO_SHARED slots.
+        DCHECK(!heap_->IsShared());
+        InvalidatedSlotsFilter filter =
+            InvalidatedSlotsFilter::OldToShared(chunk_);
+        RememberedSet<OLD_TO_SHARED>::Iterate(
+            chunk_,
+            [&filter](MaybeObjectSlot slot) {
+              return filter.IsValid(slot.address()) ? KEEP_SLOT : REMOVE_SLOT;
+            },
+            SlotSet::FREE_EMPTY_BUCKETS);
+      }
+      chunk_->ReleaseInvalidatedSlots<OLD_TO_SHARED>();
+    }
   }
 
   void UpdateTypedPointers() {
@@ -4516,13 +4574,20 @@ int MarkCompactCollectorBase::CollectRememberedSetUpdatingItems(
     const bool contains_old_to_new_slots =
         chunk->slot_set<OLD_TO_NEW>() != nullptr ||
         chunk->typed_slot_set<OLD_TO_NEW>() != nullptr;
+    const bool contains_old_to_shared_slots =
+        chunk->slot_set<OLD_TO_SHARED>() != nullptr ||
+        chunk->typed_slot_set<OLD_TO_SHARED>() != nullptr;
     const bool contains_old_to_old_invalidated_slots =
         chunk->invalidated_slots<OLD_TO_OLD>() != nullptr;
     const bool contains_old_to_new_invalidated_slots =
         chunk->invalidated_slots<OLD_TO_NEW>() != nullptr;
+    const bool contains_old_to_shared_invalidated_slots =
+        chunk->invalidated_slots<OLD_TO_SHARED>() != nullptr;
     if (!contains_old_to_new_slots && !contains_old_to_old_slots &&
         !contains_old_to_old_invalidated_slots &&
-        !contains_old_to_new_invalidated_slots && !contains_old_to_code_slots)
+        !contains_old_to_new_invalidated_slots && !contains_old_to_code_slots &&
+        !contains_old_to_shared_slots &&
+        !contains_old_to_shared_invalidated_slots)
       continue;
     if (mode == RememberedSetUpdatingMode::ALL || contains_old_to_new_slots ||
         contains_old_to_old_invalidated_slots ||
@@ -4667,14 +4732,16 @@ void MarkCompactCollector::UpdatePointersInClientHeap(Isolate* client) {
     MemoryChunk* chunk = chunk_iterator.Next();
     CodePageMemoryModificationScope unprotect_code_page(chunk);
 
+    InvalidatedSlotsFilter filter = InvalidatedSlotsFilter::OldToShared(chunk);
     RememberedSet<OLD_TO_SHARED>::Iterate(
         chunk,
-        [cage_base](MaybeObjectSlot slot) {
+        [cage_base, &filter](MaybeObjectSlot slot) {
+          if (!filter.IsValid(slot.address())) return REMOVE_SLOT;
           return UpdateSlot<AccessMode::NON_ATOMIC>(cage_base, slot);
         },
-        SlotSet::KEEP_EMPTY_BUCKETS);
+        SlotSet::FREE_EMPTY_BUCKETS);
 
-    chunk->ReleaseSlotSet<OLD_TO_SHARED>();
+    chunk->ReleaseInvalidatedSlots<OLD_TO_SHARED>();
 
     RememberedSet<OLD_TO_SHARED>::IterateTyped(
         chunk, [this](SlotType slot_type, Address slot) {
@@ -4687,8 +4754,6 @@ void MarkCompactCollector::UpdatePointersInClientHeap(Isolate* client) {
                                                                 slot);
               });
         });
-
-    chunk->ReleaseTypedSlotSet<OLD_TO_SHARED>();
   }
 
 #ifdef VERIFY_HEAP
@@ -4735,11 +4800,20 @@ void ReRecordPage(
   RememberedSet<OLD_TO_NEW>::RemoveRangeTyped(page, page->address(),
                                               failed_start);
 
+  RememberedSet<OLD_TO_SHARED>::RemoveRange(page, page->address(), failed_start,
+                                            SlotSet::FREE_EMPTY_BUCKETS);
+  RememberedSet<OLD_TO_SHARED>::RemoveRangeTyped(page, page->address(),
+                                                 failed_start);
+
   // Remove invalidated slots.
   if (failed_start > page->area_start()) {
     InvalidatedSlotsCleanup old_to_new_cleanup =
         InvalidatedSlotsCleanup::OldToNew(page);
     old_to_new_cleanup.Free(page->area_start(), failed_start);
+
+    InvalidatedSlotsCleanup old_to_shared_cleanup =
+        InvalidatedSlotsCleanup::OldToShared(page);
+    old_to_shared_cleanup.Free(page->area_start(), failed_start);
   }
 
   // Recompute live bytes.
@@ -5348,6 +5422,8 @@ void MinorMarkCompactCollector::CollectGarbage() {
   CleanupPromotedPages();
 
   SweepArrayBufferExtensions();
+
+  heap()->isolate()->global_handles()->UpdateListOfYoungNodes();
 }
 
 void MinorMarkCompactCollector::MakeIterable(
@@ -5733,7 +5809,7 @@ void MinorMarkCompactCollector::MarkRootSetInParallel(
     // Seed the root set (roots + old->new set).
     {
       TRACE_GC(heap()->tracer(), GCTracer::Scope::MINOR_MC_MARK_SEED);
-      isolate()->global_handles()->IdentifyWeakUnmodifiedObjects(
+      isolate()->global_handles()->ComputeWeaknessForYoungObjects(
           &JSObject::IsUnmodifiedApiObject);
       // MinorMC treats all weak roots except for global handles as strong.
       // That is why we don't set skip_weak = true here and instead visit
@@ -5787,11 +5863,7 @@ void MinorMarkCompactCollector::MarkLiveObjects() {
 
   {
     TRACE_GC(heap()->tracer(), GCTracer::Scope::MINOR_MC_MARK_GLOBAL_HANDLES);
-    isolate()->global_handles()->MarkYoungWeakDeadObjectsPending(
-        &IsUnmarkedObjectForYoungGeneration);
-    isolate()->global_handles()->IterateYoungWeakDeadObjectsForFinalizers(
-        &root_visitor);
-    isolate()->global_handles()->IterateYoungWeakObjectsForPhantomHandles(
+    isolate()->global_handles()->ProcessWeakYoungObjects(
         &root_visitor, &IsUnmarkedObjectForYoungGeneration);
     DrainMarkingWorklist();
   }

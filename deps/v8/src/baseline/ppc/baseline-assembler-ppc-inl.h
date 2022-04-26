@@ -534,15 +534,59 @@ void BaselineAssembler::StoreTaggedFieldNoWriteBarrier(Register target,
 
 void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
     int32_t weight, Label* skip_interrupt_label) {
-  UNIMPLEMENTED();
+  ASM_CODE_COMMENT(masm_);
+  ScratchRegisterScope scratch_scope(this);
+  Register feedback_cell = scratch_scope.AcquireScratch();
+  LoadFunction(feedback_cell);
+  LoadTaggedPointerField(feedback_cell, feedback_cell,
+                         JSFunction::kFeedbackCellOffset);
+
+  Register interrupt_budget = scratch_scope.AcquireScratch();
+  __ LoadU32(
+      interrupt_budget,
+      FieldMemOperand(feedback_cell, FeedbackCell::kInterruptBudgetOffset), r0);
+  // Remember to set flags as part of the add!
+  __ AddS32(interrupt_budget, interrupt_budget, Operand(weight), r0);
+  __ StoreU32(
+      interrupt_budget,
+      FieldMemOperand(feedback_cell, FeedbackCell::kInterruptBudgetOffset), r0);
+  if (skip_interrupt_label) {
+    // Use compare flags set by add
+    DCHECK_LT(weight, 0);
+    __ b(ge, skip_interrupt_label);
+  }
 }
 
 void BaselineAssembler::AddToInterruptBudgetAndJumpIfNotExceeded(
     Register weight, Label* skip_interrupt_label) {
-  UNIMPLEMENTED();
+  ASM_CODE_COMMENT(masm_);
+  ScratchRegisterScope scratch_scope(this);
+  Register feedback_cell = scratch_scope.AcquireScratch();
+  LoadFunction(feedback_cell);
+  LoadTaggedPointerField(feedback_cell, feedback_cell,
+                         JSFunction::kFeedbackCellOffset);
+
+  Register interrupt_budget = scratch_scope.AcquireScratch();
+  __ LoadU32(
+      interrupt_budget,
+      FieldMemOperand(feedback_cell, FeedbackCell::kInterruptBudgetOffset), r0);
+  // Remember to set flags as part of the add!
+  __ AddS32(interrupt_budget, interrupt_budget, weight);
+  __ StoreU32(
+      interrupt_budget,
+      FieldMemOperand(feedback_cell, FeedbackCell::kInterruptBudgetOffset), r0);
+  if (skip_interrupt_label) __ b(ge, skip_interrupt_label);
 }
 
-void BaselineAssembler::AddSmi(Register lhs, Smi rhs) { UNIMPLEMENTED(); }
+void BaselineAssembler::AddSmi(Register lhs, Smi rhs) {
+  if (rhs.value() == 0) return;
+  __ LoadSmiLiteral(r0, rhs);
+  if (SmiValuesAre31Bits()) {
+    __ AddS32(lhs, lhs, r0);
+  } else {
+    __ AddS64(lhs, lhs, r0);
+  }
+}
 
 void BaselineAssembler::Switch(Register reg, int case_value_base,
                                Label** labels, int num_labels) {

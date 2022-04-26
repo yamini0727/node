@@ -706,7 +706,8 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       AssemblePrepareTailCall();
       break;
     case kArchCallCFunction: {
-      int const num_parameters = MiscField::decode(instr->opcode());
+      int const num_gp_parameters = ParamField::decode(instr->opcode());
+      int const num_fp_parameters = FPParamField::decode(instr->opcode());
 #if V8_ENABLE_WEBASSEMBLY
       Label start_call;
       bool isWasmCapiFunction =
@@ -733,10 +734,10 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 #endif  // V8_ENABLE_WEBASSEMBLY
       if (instr->InputAt(0)->IsImmediate()) {
         ExternalReference ref = i.InputExternalReference(0);
-        __ CallCFunction(ref, num_parameters);
+        __ CallCFunction(ref, num_gp_parameters, num_fp_parameters);
       } else {
         Register func = i.InputRegister(0);
-        __ CallCFunction(func, num_parameters);
+        __ CallCFunction(func, num_gp_parameters, num_fp_parameters);
       }
 #if V8_ENABLE_WEBASSEMBLY
       if (isWasmCapiFunction) {
@@ -2603,16 +2604,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kMips64F32x4Neg: {
       CpuFeatureScope msa_scope(tasm(), MIPS_SIMD);
       __ bnegi_w(i.OutputSimd128Register(), i.InputSimd128Register(0), 31);
-      break;
-    }
-    case kMips64F32x4RecipApprox: {
-      CpuFeatureScope msa_scope(tasm(), MIPS_SIMD);
-      __ frcp_w(i.OutputSimd128Register(), i.InputSimd128Register(0));
-      break;
-    }
-    case kMips64F32x4RecipSqrtApprox: {
-      CpuFeatureScope msa_scope(tasm(), MIPS_SIMD);
-      __ frsqrt_w(i.OutputSimd128Register(), i.InputSimd128Register(0));
       break;
     }
     case kMips64F32x4Add: {

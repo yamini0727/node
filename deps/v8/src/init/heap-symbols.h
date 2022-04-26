@@ -535,12 +535,15 @@
   F(MARK_COMPACTOR)                                  \
   TOP_MC_SCOPES(F)                                   \
   F(MC_CLEAR_DEPENDENT_CODE)                         \
+  F(MC_CLEAR_EXTERNAL_STRING_TABLE)                  \
   F(MC_CLEAR_FLUSHABLE_BYTECODE)                     \
   F(MC_CLEAR_FLUSHED_JS_FUNCTIONS)                   \
+  F(MC_CLEAR_JOIN_JOB)                               \
   F(MC_CLEAR_MAPS)                                   \
   F(MC_CLEAR_SLOTS_BUFFER)                           \
   F(MC_CLEAR_STRING_TABLE)                           \
   F(MC_CLEAR_WEAK_COLLECTIONS)                       \
+  F(MC_CLEAR_WEAK_GLOBAL_HANDLES)                    \
   F(MC_CLEAR_WEAK_LISTS)                             \
   F(MC_CLEAR_WEAK_REFERENCES)                        \
   F(MC_SWEEP_EXTERNAL_POINTER_TABLE)                 \
@@ -571,9 +574,6 @@
   F(MC_MARK_WEAK_CLOSURE_EPHEMERON)                  \
   F(MC_MARK_WEAK_CLOSURE_EPHEMERON_MARKING)          \
   F(MC_MARK_WEAK_CLOSURE_EPHEMERON_LINEAR)           \
-  F(MC_MARK_WEAK_CLOSURE_WEAK_HANDLES)               \
-  F(MC_MARK_WEAK_CLOSURE_WEAK_ROOTS)                 \
-  F(MC_MARK_WEAK_CLOSURE_HARMONY)                    \
   F(MC_SWEEP_CODE)                                   \
   F(MC_SWEEP_MAP)                                    \
   F(MC_SWEEP_OLD)                                    \

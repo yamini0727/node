@@ -1008,8 +1008,8 @@ static void LoadTieringStateAndJumpIfNeedsProcessing(
     Label* has_optimized_code_or_state) {
   ASM_CODE_COMMENT(masm);
   Register scratch = t6;
-  __ Lw(optimization_state,
-        FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
+  __ lhu(optimization_state,
+         FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
   __ And(
       scratch, optimization_state,
       Operand(FeedbackVector::kHasOptimizedCodeOrTieringStateIsAnyRequestMask));
@@ -1241,18 +1241,11 @@ void Builtins::Generate_InterpreterEntryTrampoline(MacroAssembler* masm) {
   __ lhu(t0, FieldMemOperand(t0, Map::kInstanceTypeOffset));
   __ Branch(&push_stack_frame, ne, t0, Operand(FEEDBACK_VECTOR_TYPE));
 
-  // Read off the optimization state in the feedback vector, and if there
-  // is optimized code or an tiering state, call that instead.
-  Register optimization_state = t0;
-  __ Lw(optimization_state,
-        FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
-
-  // Check if the optimized code slot is not empty or has a tiering state.
+  // Check the tiering state.
   Label has_optimized_code_or_state;
-
-  __ andi(t1, optimization_state,
-          FeedbackVector::kHasOptimizedCodeOrTieringStateIsAnyRequestMask);
-  __ Branch(&has_optimized_code_or_state, ne, t1, Operand(zero_reg));
+  Register optimization_state = t0;
+  LoadTieringStateAndJumpIfNeedsProcessing(
+      masm, optimization_state, feedback_vector, &has_optimized_code_or_state);
 
   Label not_optimized;
   __ bind(&not_optimized);
@@ -1789,7 +1782,43 @@ void Generate_OSREntry(MacroAssembler* masm, Register entry_address,
   __ Ret();
 }
 
-void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
+enum class OsrSourceTier {
+  kInterpreter,
+  kBaseline,
+};
+
+void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
+                        Register current_loop_depth,
+                        Register encoded_current_bytecode_offset,
+                        Register osr_urgency_and_install_target) {
+  static constexpr Register scratch = a3;
+  DCHECK(!AreAliased(scratch, current_loop_depth,
+                     encoded_current_bytecode_offset,
+                     osr_urgency_and_install_target));
+  // OSR based on urgency, i.e. is the OSR urgency greater than the current
+  // loop depth?
+  Label try_osr;
+  STATIC_ASSERT(BytecodeArray::OsrUrgencyBits::kShift == 0);
+  Register urgency = scratch;
+  __ And(urgency, osr_urgency_and_install_target,
+         BytecodeArray::OsrUrgencyBits::kMask);
+  __ Branch(&try_osr, hi, urgency, Operand(current_loop_depth));
+
+  // OSR based on the install target offset, i.e. does the current bytecode
+  // offset match the install target offset?
+  static constexpr int kMask = BytecodeArray::OsrInstallTargetBits::kMask;
+  Register install_target = osr_urgency_and_install_target;
+  __ And(install_target, osr_urgency_and_install_target, Operand(kMask));
+  __ Branch(&try_osr, eq, install_target,
+            Operand(encoded_current_bytecode_offset));
+
+  // Neither urgency nor the install target triggered, return to the caller.
+  // Note: the return value must be nullptr or a valid Code object.
+  __ Move(v0, zero_reg);
+  __ Ret();
+
+  __ bind(&try_osr);
+
   {
     FrameScope scope(masm, StackFrame::INTERNAL);
     __ CallRuntime(Runtime::kCompileOptimizedOSR);
@@ -1798,7 +1827,7 @@ void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
   // If the code object is null, just return to the caller.
   __ Ret(eq, v0, Operand(Smi::zero()));
 
-  if (is_interpreter) {
+  if (source == OsrSourceTier::kInterpreter) {
     // Drop the handler frame that is be sitting on top of the actual
     // JavaScript frame. This is the case then OSR is triggered from bytecode.
     __ LeaveFrame(StackFrame::STUB);
@@ -1823,13 +1852,24 @@ void OnStackReplacement(MacroAssembler* masm, bool is_interpreter) {
 }  // namespace
 
 void Builtins::Generate_InterpreterOnStackReplacement(MacroAssembler* masm) {
-  return OnStackReplacement(masm, true);
+  using D = InterpreterOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+  OnStackReplacement(masm, OsrSourceTier::kInterpreter,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 
 void Builtins::Generate_BaselineOnStackReplacement(MacroAssembler* masm) {
+  using D = BaselineOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+
   __ Lw(kContextRegister,
         MemOperand(fp, StandardFrameConstants::kContextOffset));
-  return OnStackReplacement(masm, false);
+  OnStackReplacement(masm, OsrSourceTier::kBaseline,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 
 // static
@@ -4000,10 +4040,6 @@ void Builtins::Generate_DeoptimizationEntry_Eager(MacroAssembler* masm) {
 
 void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
-}
-
-void Builtins::Generate_DeoptimizationEntry_Unused(MacroAssembler* masm) {
-  Generate_DeoptimizationEntry(masm, DeoptimizeKind::kUnused);
 }
 
 namespace {

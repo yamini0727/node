@@ -105,7 +105,7 @@ class JSTemporalCalendar
   // #sec-temporal.calendar.prototype.tostring
   static MaybeHandle<String> ToString(Isolate* isolate,
                                       Handle<JSTemporalCalendar> calendar,
-                                      const char* method);
+                                      const char* method_name);
 
   DECL_PRINTER(JSTemporalCalendar)
 
@@ -363,7 +363,7 @@ class JSTemporalTimeZone
   // #sec-temporal.timezone.prototype.tostring
   static MaybeHandle<Object> ToString(Isolate* isolate,
                                       Handle<JSTemporalTimeZone> time_zone,
-                                      const char* method);
+                                      const char* method_name);
 
   DECL_PRINTER(JSTemporalTimeZone)
 
@@ -430,6 +430,14 @@ class JSTemporalZonedDateTime
   V8_WARN_UNUSED_RESULT static MaybeHandle<JSTemporalZonedDateTime> NowISO(
       Isolate* isolate, Handle<Object> temporal_time_zone_like);
 
+  // #sec-get-temporal.zoneddatetime.prototype.offsetnanoseconds
+  V8_WARN_UNUSED_RESULT static MaybeHandle<Object> OffsetNanoseconds(
+      Isolate* isolate, Handle<JSTemporalZonedDateTime> zoned_date_time);
+
+  // #sec-get-temporal.zoneddatetime.prototype.offset
+  V8_WARN_UNUSED_RESULT static MaybeHandle<String> Offset(
+      Isolate* isolate, Handle<JSTemporalZonedDateTime> zoned_date_time);
+
   DECL_PRINTER(JSTemporalZonedDateTime)
 
   TQ_OBJECT_CONSTRUCTORS(JSTemporalZonedDateTime)
@@ -471,7 +479,7 @@ BuiltinTimeZoneGetPlainDateTimeFor(Isolate* isolate,
                                    Handle<JSReceiver> time_zone,
                                    Handle<JSTemporalInstant> instant,
                                    Handle<JSReceiver> calendar,
-                                   const char* method);
+                                   const char* method_name);
 
 V8_WARN_UNUSED_RESULT MaybeHandle<Object> InvokeCalendarMethod(
     Isolate* isolate, Handle<JSReceiver> calendar, Handle<String> name,
@@ -479,11 +487,14 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> InvokeCalendarMethod(
 
 V8_WARN_UNUSED_RESULT MaybeHandle<JSReceiver> ToTemporalCalendar(
     Isolate* isolate, Handle<Object> temporal_calendar_like,
-    const char* method);
+    const char* method_name);
 
 V8_WARN_UNUSED_RESULT MaybeHandle<JSReceiver> ToTemporalTimeZone(
     Isolate* isolate, Handle<Object> temporal_time_zone_like,
-    const char* method);
+    const char* method_name);
+
+V8_WARN_UNUSED_RESULT MaybeHandle<Oddball> IsInvalidTemporalCalendarField(
+    Isolate* isolate, Handle<String> string, Handle<FixedArray> field_names);
 
 }  // namespace temporal
 }  // namespace internal

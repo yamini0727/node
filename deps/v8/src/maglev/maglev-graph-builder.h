@@ -26,21 +26,33 @@ namespace maglev {
 class MaglevGraphBuilder {
  public:
   explicit MaglevGraphBuilder(LocalIsolate* local_isolate,
-                              MaglevCompilationUnit* compilation_unit);
+                              MaglevCompilationUnit* compilation_unit,
+                              Graph* graph,
+                              MaglevGraphBuilder* parent = nullptr);
 
   void Build() {
+    DCHECK(!is_inline());
+
+    StartPrologue();
+    for (int i = 0; i < parameter_count(); i++) {
+      SetArgument(i, AddNewNode<InitialValue>(
+                         {}, interpreter::Register::FromParameterIndex(i)));
+    }
+    BuildRegisterFrameInitialization();
+    EndPrologue();
+    BuildBody();
+  }
+
+  void StartPrologue();
+  void SetArgument(int i, ValueNode* value);
+  void BuildRegisterFrameInitialization();
+  BasicBlock* EndPrologue();
+
+  void BuildBody() {
     for (iterator_.Reset(); !iterator_.done(); iterator_.Advance()) {
       VisitSingleBytecode();
       // TODO(v8:7700): Clean up after all bytecodes are supported.
       if (found_unsupported_bytecode()) break;
-    }
-
-    // During InterpreterFrameState merge points, we might emit CheckedSmiTags
-    // and add them unsafely to the basic blocks. This addition might break a
-    // list invariant (namely `tail_` might not point to the last element).
-    // We revalidate this invariant here in all basic blocks.
-    for (BasicBlock* block : *graph_) {
-      block->nodes().RevalidateTail();
     }
   }
 
@@ -123,38 +135,54 @@ class MaglevGraphBuilder {
     BasicBlock* block = CreateBlock<Deopt>({});
     ResolveJumpsToBlockAtOffset(block, block_offset_);
 
-    // Skip any bytecodes remaining in the block, up to the next merge point.
-    while (!IsOffsetAMergePoint(iterator_.next_offset())) {
+    // Skip any bytecodes remaining in the block, up to the next merge point
+    // with non-dead predecessors.
+    int saved_offset = iterator_.current_offset();
+    while (true) {
       iterator_.Advance();
       if (iterator_.done()) break;
+
+      if (IsOffsetAMergePoint(iterator_.current_offset())) {
+        // Loops that are unreachable aside from their back-edge are going to
+        // be entirely unreachable, thanks to irreducibility.
+        if (!merge_states_[iterator_.current_offset()]->is_unreachable_loop()) {
+          break;
+        }
+      }
+
+      // If the current bytecode is a jump to elsewhere, then this jump is
+      // also dead and we should make sure to merge it as a dead predecessor.
+      interpreter::Bytecode bytecode = iterator_.current_bytecode();
+      if (interpreter::Bytecodes::IsForwardJump(bytecode)) {
+        // Jumps merge into their target, and conditional jumps also merge into
+        // the fallthrough.
+        MergeDeadIntoFrameState(iterator_.GetJumpTargetOffset());
+        if (interpreter::Bytecodes::IsConditionalJump(bytecode)) {
+          MergeDeadIntoFrameState(iterator_.next_offset());
+        }
+      } else if (bytecode == interpreter::Bytecode::kJumpLoop) {
+        // JumpLoop merges into its loop header, which has to be treated
+        // specially by the merge..
+        int target = iterator_.GetJumpTargetOffset();
+        merge_states_[target]->MergeDeadLoop();
+      } else if (interpreter::Bytecodes::IsSwitch(bytecode)) {
+        // Switches merge into their targets, and into the fallthrough.
+        for (auto offset : iterator_.GetJumpTableTargetOffsets()) {
+          MergeDeadIntoFrameState(offset.target_offset);
+        }
+        MergeDeadIntoFrameState(iterator_.next_offset());
+      } else if (!interpreter::Bytecodes::Returns(bytecode) &&
+                 !interpreter::Bytecodes::UnconditionallyThrows(bytecode)) {
+        // Any other bytecode that doesn't return or throw will merge into the
+        // fallthrough.
+        MergeDeadIntoFrameState(iterator_.next_offset());
+      }
+      saved_offset = iterator_.current_offset();
     }
 
-    // If there is control flow out of this block, we need to kill the merges
-    // into the control flow targets.
-    interpreter::Bytecode bytecode = iterator_.current_bytecode();
-    if (interpreter::Bytecodes::IsForwardJump(bytecode)) {
-      // Jumps merge into their target, and conditional jumps also merge into
-      // the fallthrough.
-      merge_states_[iterator_.GetJumpTargetOffset()]->MergeDead();
-      if (interpreter::Bytecodes::IsConditionalJump(bytecode)) {
-        merge_states_[iterator_.next_offset()]->MergeDead();
-      }
-    } else if (bytecode == interpreter::Bytecode::kJumpLoop) {
-      // JumpLoop merges into its loop header, which has to be treated specially
-      // by the merge..
-      merge_states_[iterator_.GetJumpTargetOffset()]->MergeDeadLoop();
-    } else if (interpreter::Bytecodes::IsSwitch(bytecode)) {
-      // Switches merge into their targets, and into the fallthrough.
-      for (auto offset : iterator_.GetJumpTableTargetOffsets()) {
-        merge_states_[offset.target_offset]->MergeDead();
-      }
-      merge_states_[iterator_.next_offset()]->MergeDead();
-    } else if (!interpreter::Bytecodes::Returns(bytecode) &&
-               !interpreter::Bytecodes::UnconditionallyThrows(bytecode)) {
-      // Any other bytecode that doesn't return or throw will merge into the
-      // fallthrough.
-      merge_states_[iterator_.next_offset()]->MergeDead();
-    }
+    // Restore the offset to before the Advance, so that the bytecode visiting
+    // loop can Advance it again.
+    iterator_.SetOffset(saved_offset);
   }
 
   void VisitSingleBytecode() {
@@ -273,8 +301,12 @@ class MaglevGraphBuilder {
   ValueNode* GetTaggedValue(interpreter::Register reg) {
     // TODO(victorgomes): Add the representation (Tagged/Untagged) in the
     // InterpreterFrameState, so that we don't need to derefence a node.
+    // TODO(victorgomes): Support Float64.
     ValueNode* value = current_interpreter_frame_.get(reg);
-    if (!value->is_untagged_value()) return value;
+    if (value->properties().value_representation() ==
+        ValueRepresentation::kTagged) {
+      return value;
+    }
     if (value->Is<CheckedSmiUntag>()) {
       return value->input(0).node();
     }
@@ -284,24 +316,30 @@ class MaglevGraphBuilder {
     return tagged;
   }
 
-  ValueNode* GetSmiUntaggedValue(interpreter::Register reg) {
+  ValueNode* GetInt32(interpreter::Register reg) {
     // TODO(victorgomes): Add the representation (Tagged/Untagged) in the
     // InterpreterFrameState, so that we don't need to derefence a node.
+    // TODO(victorgomes): Support Float64.
     ValueNode* value = current_interpreter_frame_.get(reg);
-    if (value->is_untagged_value()) return value;
+    if (value->properties().value_representation() ==
+        ValueRepresentation::kInt32) {
+      return value;
+    }
     if (value->Is<CheckedSmiTag>()) return value->input(0).node();
     // Untag any other value.
+    DCHECK_EQ(value->properties().value_representation(),
+              ValueRepresentation::kTagged);
     ValueNode* untagged = AddNewNode<CheckedSmiUntag>({value});
     current_interpreter_frame_.set(reg, untagged);
     return untagged;
   }
 
-  ValueNode* GetAccumulatorTaggedValue() {
+  ValueNode* GetAccumulatorTagged() {
     return GetTaggedValue(interpreter::Register::virtual_accumulator());
   }
 
-  ValueNode* GetAccumulatorSmiUntaggedValue() {
-    return GetSmiUntaggedValue(interpreter::Register::virtual_accumulator());
+  ValueNode* GetAccumulatorInt32() {
+    return GetInt32(interpreter::Register::virtual_accumulator());
   }
 
   bool IsRegisterEqualToAccumulator(int operand_index) {
@@ -310,12 +348,12 @@ class MaglevGraphBuilder {
            current_interpreter_frame_.accumulator();
   }
 
-  ValueNode* LoadRegisterTaggedValue(int operand_index) {
+  ValueNode* LoadRegisterTagged(int operand_index) {
     return GetTaggedValue(iterator_.GetRegisterOperand(operand_index));
   }
 
-  ValueNode* LoadRegisterSmiUntaggedValue(int operand_index) {
-    return GetSmiUntaggedValue(iterator_.GetRegisterOperand(operand_index));
+  ValueNode* LoadRegisterInt32(int operand_index) {
+    return GetInt32(iterator_.GetRegisterOperand(operand_index));
   }
 
   template <typename NodeT>
@@ -340,7 +378,13 @@ class MaglevGraphBuilder {
       latest_checkpointed_state_.emplace(
           BytecodeOffset(iterator_.current_offset()),
           zone()->New<CompactInterpreterFrameState>(
-              *compilation_unit_, GetInLiveness(), current_interpreter_frame_));
+              *compilation_unit_, GetInLiveness(), current_interpreter_frame_),
+          parent_ == nullptr
+              ? nullptr
+              // TODO(leszeks): Don't always allocate for the parent state,
+              // maybe cache it on the graph builder?
+              : zone()->New<CheckpointedInterpreterState>(
+                    parent_->GetLatestCheckpointedState()));
     }
     return *latest_checkpointed_state_;
   }
@@ -349,7 +393,9 @@ class MaglevGraphBuilder {
     return CheckpointedInterpreterState(
         BytecodeOffset(iterator_.current_offset()),
         zone()->New<CompactInterpreterFrameState>(
-            *compilation_unit_, GetOutLiveness(), current_interpreter_frame_));
+            *compilation_unit_, GetOutLiveness(), current_interpreter_frame_),
+        // TODO(leszeks): Support lazy deopts in inlined functions.
+        nullptr);
   }
 
   template <typename NodeT>
@@ -441,6 +487,10 @@ class MaglevGraphBuilder {
     return block;
   }
 
+  void InlineCallFromRegisters(int argc_count,
+                               ConvertReceiverMode receiver_mode,
+                               compiler::JSFunctionRef function);
+
   void BuildCallFromRegisterList(ConvertReceiverMode receiver_mode);
   void BuildCallFromRegisters(int argc_count,
                               ConvertReceiverMode receiver_mode);
@@ -462,6 +512,8 @@ class MaglevGraphBuilder {
   void VisitBinarySmiOperation();
 
   void MergeIntoFrameState(BasicBlock* block, int target);
+  void MergeDeadIntoFrameState(int target);
+  void MergeIntoInlinedReturnFrameState(BasicBlock* block);
   void BuildBranchIfTrue(ValueNode* node, int true_target, int false_target);
   void BuildBranchIfToBooleanTrue(ValueNode* node, int true_target,
                                   int false_target);
@@ -488,11 +540,17 @@ class MaglevGraphBuilder {
       } else if (interpreter::Bytecodes::Returns(bytecode) ||
                  interpreter::Bytecodes::UnconditionallyThrows(bytecode)) {
         predecessors_[iterator.next_offset()]--;
+        // Collect inline return jumps in the slot after the last bytecode.
+        if (is_inline() && interpreter::Bytecodes::Returns(bytecode)) {
+          predecessors_[array_length - 1]++;
+        }
       }
       // TODO(leszeks): Also consider handler entries (the bytecode analysis)
       // will do this automatically I guess if we merge this into that.
     }
-    DCHECK_EQ(0, predecessors_[bytecode().length()]);
+    if (!is_inline()) {
+      DCHECK_EQ(0, predecessors_[bytecode().length()]);
+    }
   }
 
   int NumPredecessors(int offset) { return predecessors_[offset]; }
@@ -527,8 +585,20 @@ class MaglevGraphBuilder {
     return compilation_unit_->graph_labeller();
   }
 
+  // True when this graph builder is building the subgraph of an inlined
+  // function.
+  bool is_inline() const { return parent_ != nullptr; }
+
+  // The fake offset used as a target for all exits of an inlined function.
+  int inline_exit_offset() const {
+    DCHECK(is_inline());
+    return bytecode().length();
+  }
+
   LocalIsolate* const local_isolate_;
   MaglevCompilationUnit* const compilation_unit_;
+  MaglevGraphBuilder* const parent_;
+  Graph* const graph_;
   interpreter::BytecodeArrayIterator iterator_;
   uint32_t* predecessors_;
 
@@ -540,7 +610,6 @@ class MaglevGraphBuilder {
   BasicBlockRef* jump_targets_;
   MergePointInterpreterFrameState** merge_states_;
 
-  Graph* const graph_;
   InterpreterFrameState current_interpreter_frame_;
 
   // Allow marking some bytecodes as unsupported during graph building, so that

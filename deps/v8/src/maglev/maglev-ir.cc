@@ -100,7 +100,7 @@ void PushInput(MaglevCodeGenState* code_gen_state, const Input& input) {
     __ Push(operand.GetRegister());
   } else {
     DCHECK(operand.IsStackSlot());
-    __ Push(GetStackSlot(operand));
+    __ Push(code_gen_state->GetStackSlot(operand));
   }
 }
 
@@ -113,14 +113,14 @@ template <typename T, typename Enable = void>
 struct CopyForDeferredHelper {
   template <typename U>
   struct No_Copy_Helper_Implemented_For_Type;
-  static void Copy(MaglevCompilationUnit* compilation_unit,
+  static void Copy(MaglevCompilationInfo* compilation_info,
                    No_Copy_Helper_Implemented_For_Type<T>);
 };
 
 // Helper for copies by value.
 template <typename T, typename Enable = void>
 struct CopyForDeferredByValue {
-  static T Copy(MaglevCompilationUnit* compilation_unit, T node) {
+  static T Copy(MaglevCompilationInfo* compilation_info, T node) {
     return node;
   }
 };
@@ -139,10 +139,10 @@ template <typename T>
 struct CopyForDeferredHelper<
     T, typename std::enable_if<std::is_enum<T>::value>::type>
     : public CopyForDeferredByValue<T> {};
-// MaglevCompilationUnits are copied by value.
+// MaglevCompilationInfos are copied by value.
 template <>
-struct CopyForDeferredHelper<MaglevCompilationUnit*>
-    : public CopyForDeferredByValue<MaglevCompilationUnit*> {};
+struct CopyForDeferredHelper<MaglevCompilationInfo*>
+    : public CopyForDeferredByValue<MaglevCompilationInfo*> {};
 // Machine registers are copied by value.
 template <>
 struct CopyForDeferredHelper<Register>
@@ -151,36 +151,25 @@ struct CopyForDeferredHelper<Register>
 template <>
 struct CopyForDeferredHelper<BytecodeOffset>
     : public CopyForDeferredByValue<BytecodeOffset> {};
-
-// InterpreterFrameState is cloned.
-template <>
-struct CopyForDeferredHelper<const InterpreterFrameState*> {
-  static const InterpreterFrameState* Copy(
-      MaglevCompilationUnit* compilation_unit,
-      const InterpreterFrameState* frame_state) {
-    return compilation_unit->zone()->New<InterpreterFrameState>(
-        *compilation_unit, *frame_state);
-  }
-};
 // EagerDeoptInfo pointers are copied by value.
 template <>
 struct CopyForDeferredHelper<EagerDeoptInfo*>
     : public CopyForDeferredByValue<EagerDeoptInfo*> {};
 
 template <typename T>
-T CopyForDeferred(MaglevCompilationUnit* compilation_unit, T&& value) {
-  return CopyForDeferredHelper<T>::Copy(compilation_unit,
+T CopyForDeferred(MaglevCompilationInfo* compilation_info, T&& value) {
+  return CopyForDeferredHelper<T>::Copy(compilation_info,
                                         std::forward<T>(value));
 }
 
 template <typename T>
-T CopyForDeferred(MaglevCompilationUnit* compilation_unit, T& value) {
-  return CopyForDeferredHelper<T>::Copy(compilation_unit, value);
+T CopyForDeferred(MaglevCompilationInfo* compilation_info, T& value) {
+  return CopyForDeferredHelper<T>::Copy(compilation_info, value);
 }
 
 template <typename T>
-T CopyForDeferred(MaglevCompilationUnit* compilation_unit, const T& value) {
-  return CopyForDeferredHelper<T>::Copy(compilation_unit, value);
+T CopyForDeferred(MaglevCompilationInfo* compilation_info, const T& value) {
+  return CopyForDeferredHelper<T>::Copy(compilation_info, value);
 }
 
 template <typename Function, typename FunctionPointer = Function>
@@ -213,10 +202,10 @@ class DeferredCodeInfoImpl final : public DeferredCodeInfo {
   static constexpr size_t kSize = FunctionArgumentsTupleHelper<Function>::kSize;
 
   template <typename... InArgs>
-  explicit DeferredCodeInfoImpl(MaglevCompilationUnit* compilation_unit,
+  explicit DeferredCodeInfoImpl(MaglevCompilationInfo* compilation_info,
                                 FunctionPointer function, InArgs&&... args)
       : function(function),
-        args(CopyForDeferred(compilation_unit, std::forward<InArgs>(args))...) {
+        args(CopyForDeferred(compilation_info, std::forward<InArgs>(args))...) {
   }
 
   DeferredCodeInfoImpl(DeferredCodeInfoImpl&&) = delete;
@@ -244,8 +233,8 @@ void JumpToDeferredIf(Condition cond, MaglevCodeGenState* code_gen_state,
                       Function&& deferred_code_gen, Args&&... args) {
   using DeferredCodeInfoT = DeferredCodeInfoImpl<Function>;
   DeferredCodeInfoT* deferred_code =
-      code_gen_state->compilation_unit()->zone()->New<DeferredCodeInfoT>(
-          code_gen_state->compilation_unit(), deferred_code_gen,
+      code_gen_state->compilation_info()->zone()->New<DeferredCodeInfoT>(
+          code_gen_state->compilation_info(), deferred_code_gen,
           std::forward<Args>(args)...);
 
   code_gen_state->PushDeferredCode(deferred_code);
@@ -347,15 +336,32 @@ void NodeBase::Print(std::ostream& os,
   UNREACHABLE();
 }
 
+namespace {
+size_t GetInputLocationsArraySize(const MaglevCompilationUnit& compilation_unit,
+                                  const CheckpointedInterpreterState& state) {
+  size_t size = state.register_frame->size(compilation_unit);
+  const CheckpointedInterpreterState* parent = state.parent;
+  const MaglevCompilationUnit* parent_unit = compilation_unit.caller();
+  while (parent != nullptr) {
+    size += parent->register_frame->size(*parent_unit);
+    parent = parent->parent;
+    parent_unit = parent_unit->caller();
+  }
+  return size;
+}
+}  // namespace
+
 DeoptInfo::DeoptInfo(Zone* zone, const MaglevCompilationUnit& compilation_unit,
                      CheckpointedInterpreterState state)
-    : state(state),
+    : unit(compilation_unit),
+      state(state),
       input_locations(zone->NewArray<InputLocation>(
-          state.register_frame->size(compilation_unit))) {
+          GetInputLocationsArraySize(compilation_unit, state))) {
   // Default initialise if we're printing the graph, to avoid printing junk
   // values.
   if (FLAG_print_maglev_graph) {
-    for (size_t i = 0; i < state.register_frame->size(compilation_unit); ++i) {
+    for (size_t i = 0; i < GetInputLocationsArraySize(compilation_unit, state);
+         ++i) {
       new (&input_locations[i]) InputLocation();
     }
   }
@@ -525,47 +531,20 @@ void CheckMaps::PrintParams(std::ostream& os,
   os << "(" << *map().object() << ")";
 }
 
-void LoadField::AllocateVreg(MaglevVregAllocationState* vreg_state,
-                             const ProcessingState& state) {
+void LoadTaggedField::AllocateVreg(MaglevVregAllocationState* vreg_state,
+                                   const ProcessingState& state) {
   UseRegister(object_input());
   DefineAsRegister(vreg_state, this);
 }
-void LoadField::GenerateCode(MaglevCodeGenState* code_gen_state,
-                             const ProcessingState& state) {
-  // os << "kField, is in object = "
-  //    << LoadHandler::IsInobjectBits::decode(raw_handler)
-  //    << ", is double = " << LoadHandler::IsDoubleBits::decode(raw_handler)
-  //    << ", field index = " <<
-  //    LoadHandler::FieldIndexBits::decode(raw_handler);
-
+void LoadTaggedField::GenerateCode(MaglevCodeGenState* code_gen_state,
+                                   const ProcessingState& state) {
   Register object = ToRegister(object_input());
-  Register res = ToRegister(result());
-  int handler = this->handler();
-
-  if (LoadHandler::IsInobjectBits::decode(handler)) {
-    Operand input_field_operand = FieldOperand(
-        object, LoadHandler::FieldIndexBits::decode(handler) * kTaggedSize);
-    __ DecompressAnyTagged(res, input_field_operand);
-  } else {
-    Operand property_array_operand =
-        FieldOperand(object, JSReceiver::kPropertiesOrHashOffset);
-    __ DecompressAnyTagged(res, property_array_operand);
-
-    __ AssertNotSmi(res);
-
-    Operand input_field_operand = FieldOperand(
-        res, LoadHandler::FieldIndexBits::decode(handler) * kTaggedSize);
-    __ DecompressAnyTagged(res, input_field_operand);
-  }
-
-  if (LoadHandler::IsDoubleBits::decode(handler)) {
-    // TODO(leszeks): Copy out the value, either as a double or a HeapNumber.
-    UNSUPPORTED("LoadField double property");
-  }
+  __ AssertNotSmi(object);
+  __ DecompressAnyTagged(ToRegister(result()), FieldOperand(object, offset()));
 }
-void LoadField::PrintParams(std::ostream& os,
-                            MaglevGraphLabeller* graph_labeller) const {
-  os << "(" << std::hex << handler() << std::dec << ")";
+void LoadTaggedField::PrintParams(std::ostream& os,
+                                  MaglevGraphLabeller* graph_labeller) const {
+  os << "(0x" << std::hex << offset() << std::dec << ")";
 }
 
 void StoreField::AllocateVreg(MaglevVregAllocationState* vreg_state,
@@ -628,15 +607,15 @@ void GapMove::GenerateCode(MaglevCodeGenState* code_gen_state,
     if (target().IsAnyRegister()) {
       __ movq(ToRegister(target()), source_reg);
     } else {
-      __ movq(ToMemOperand(target()), source_reg);
+      __ movq(code_gen_state->ToMemOperand(target()), source_reg);
     }
   } else {
-    MemOperand source_op = ToMemOperand(source());
+    MemOperand source_op = code_gen_state->ToMemOperand(source());
     if (target().IsAnyRegister()) {
       __ movq(ToRegister(target()), source_op);
     } else {
       __ movq(kScratchRegister, source_op);
-      __ movq(ToMemOperand(target()), kScratchRegister);
+      __ movq(code_gen_state->ToMemOperand(target()), kScratchRegister);
     }
   }
 }
@@ -852,6 +831,12 @@ void Return::GenerateCode(MaglevCodeGenState* code_gen_state,
                           const ProcessingState& state) {
   DCHECK_EQ(ToRegister(value_input()), kReturnRegister0);
 
+  // Read the formal number of parameters from the top level compilation unit
+  // (i.e. the outermost, non inlined function).
+  int formal_params_size = code_gen_state->compilation_info()
+                               ->toplevel_compilation_unit()
+                               ->parameter_count();
+
   // We're not going to continue execution, so we can use an arbitrary register
   // here instead of relying on temporaries from the register allocator.
   Register actual_params_size = r8;
@@ -869,12 +854,11 @@ void Return::GenerateCode(MaglevCodeGenState* code_gen_state,
   // If actual is bigger than formal, then we should use it to free up the stack
   // arguments.
   Label drop_dynamic_arg_size;
-  __ cmpq(actual_params_size, Immediate(code_gen_state->parameter_count()));
+  __ cmpq(actual_params_size, Immediate(formal_params_size));
   __ j(greater, &drop_dynamic_arg_size);
 
   // Drop receiver + arguments according to static formal arguments size.
-  __ Ret(code_gen_state->parameter_count() * kSystemPointerSize,
-         kScratchRegister);
+  __ Ret(formal_params_size * kSystemPointerSize, kScratchRegister);
 
   __ bind(&drop_dynamic_arg_size);
   // Drop receiver + arguments according to dynamic arguments size.
@@ -894,6 +878,30 @@ void Jump::AllocateVreg(MaglevVregAllocationState* vreg_state,
                         const ProcessingState& state) {}
 void Jump::GenerateCode(MaglevCodeGenState* code_gen_state,
                         const ProcessingState& state) {
+  // Avoid emitting a jump to the next block.
+  if (target() != state.next_block()) {
+    __ jmp(target()->label());
+  }
+}
+
+void JumpToInlined::AllocateVreg(MaglevVregAllocationState* vreg_state,
+                                 const ProcessingState& state) {}
+void JumpToInlined::GenerateCode(MaglevCodeGenState* code_gen_state,
+                                 const ProcessingState& state) {
+  // Avoid emitting a jump to the next block.
+  if (target() != state.next_block()) {
+    __ jmp(target()->label());
+  }
+}
+void JumpToInlined::PrintParams(std::ostream& os,
+                                MaglevGraphLabeller* graph_labeller) const {
+  os << "(" << Brief(*unit()->shared_function_info().object()) << ")";
+}
+
+void JumpFromInlined::AllocateVreg(MaglevVregAllocationState* vreg_state,
+                                   const ProcessingState& state) {}
+void JumpFromInlined::GenerateCode(MaglevCodeGenState* code_gen_state,
+                                   const ProcessingState& state) {
   // Avoid emitting a jump to the next block.
   if (target() != state.next_block()) {
     __ jmp(target()->label());

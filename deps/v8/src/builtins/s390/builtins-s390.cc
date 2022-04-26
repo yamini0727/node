@@ -255,7 +255,39 @@ enum class OsrSourceTier {
   kBaseline,
 };
 
-void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source) {
+void OnStackReplacement(MacroAssembler* masm, OsrSourceTier source,
+                        Register current_loop_depth,
+                        Register encoded_current_bytecode_offset,
+                        Register osr_urgency_and_install_target) {
+  static constexpr Register scratch = r5;
+  DCHECK(!AreAliased(scratch, current_loop_depth,
+                     encoded_current_bytecode_offset,
+                     osr_urgency_and_install_target));
+  // OSR based on urgency, i.e. is the OSR urgency greater than the current
+  // loop depth?
+  Label try_osr;
+  STATIC_ASSERT(BytecodeArray::OsrUrgencyBits::kShift == 0);
+  Register urgency = scratch;
+  __ AndP(urgency, osr_urgency_and_install_target,
+          Operand(BytecodeArray::OsrUrgencyBits::kMask));
+  __ CmpU64(urgency, current_loop_depth);
+  __ bgt(&try_osr);
+
+  // OSR based on the install target offset, i.e. does the current bytecode
+  // offset match the install target offset?
+  static constexpr int kMask = BytecodeArray::OsrInstallTargetBits::kMask;
+  Register install_target = osr_urgency_and_install_target;
+  __ AndP(install_target, osr_urgency_and_install_target, Operand(kMask));
+  __ CmpU64(install_target, encoded_current_bytecode_offset);
+  __ beq(&try_osr);
+
+  // Neither urgency nor the install target triggered, return to the caller.
+  // Note: the return value must be nullptr or a valid Code object.
+  __ mov(r2, Operand(0));
+  __ Ret(0);
+
+  __ bind(&try_osr);
+
   ASM_CODE_COMMENT(masm);
   {
     FrameScope scope(masm, StackFrame::INTERNAL);
@@ -1345,9 +1377,8 @@ static void LoadTieringStateAndJumpIfNeedsProcessing(
     MacroAssembler* masm, Register optimization_state, Register feedback_vector,
     Label* has_optimized_code_or_state) {
   ASM_CODE_COMMENT(masm);
-  USE(LoadTieringStateAndJumpIfNeedsProcessing);
   DCHECK(!AreAliased(optimization_state, feedback_vector));
-  __ LoadU32(optimization_state,
+  __ LoadU16(optimization_state,
              FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
   CHECK(is_uint16(
       FeedbackVector::kHasOptimizedCodeOrTieringStateIsAnyRequestMask));
@@ -1548,17 +1579,9 @@ void Builtins::Generate_InterpreterEntryTrampoline(MacroAssembler* masm) {
   __ bne(&push_stack_frame);
 
   Register optimization_state = r6;
-
-  // Read off the optimization state in the feedback vector.
-  __ LoadS32(optimization_state,
-           FieldMemOperand(feedback_vector, FeedbackVector::kFlagsOffset));
-
-  // Check if the optimized code slot is not empty or has a tiering state.
   Label has_optimized_code_or_state;
-  __ TestBitMask(
-      optimization_state,
-      FeedbackVector::kHasOptimizedCodeOrTieringStateIsAnyRequestMask, r0);
-  __ bne(&has_optimized_code_or_state);
+  LoadTieringStateAndJumpIfNeedsProcessing(
+      masm, optimization_state, feedback_vector, &has_optimized_code_or_state);
 
   Label not_optimized;
   __ bind(&not_optimized);
@@ -3836,19 +3859,26 @@ void Builtins::Generate_DeoptimizationEntry_Lazy(MacroAssembler* masm) {
   Generate_DeoptimizationEntry(masm, DeoptimizeKind::kLazy);
 }
 
-void Builtins::Generate_DeoptimizationEntry_Unused(MacroAssembler* masm) {
-  Generate_DeoptimizationEntry(masm, DeoptimizeKind::kUnused);
-}
-
 void Builtins::Generate_InterpreterOnStackReplacement(MacroAssembler* masm) {
-  OnStackReplacement(masm, OsrSourceTier::kInterpreter);
+  using D = InterpreterOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+  OnStackReplacement(masm, OsrSourceTier::kInterpreter,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 
 #if ENABLE_SPARKPLUG
 void Builtins::Generate_BaselineOnStackReplacement(MacroAssembler* masm) {
+  using D = BaselineOnStackReplacementDescriptor;
+  STATIC_ASSERT(D::kParameterCount == 3);
+
   __ LoadU64(kContextRegister,
          MemOperand(fp, BaselineFrameConstants::kContextOffset));
-  OnStackReplacement(masm, OsrSourceTier::kBaseline);
+  OnStackReplacement(masm, OsrSourceTier::kBaseline,
+                     D::CurrentLoopDepthRegister(),
+                     D::EncodedCurrentBytecodeOffsetRegister(),
+                     D::OsrUrgencyAndInstallTargetRegister());
 }
 #endif
 

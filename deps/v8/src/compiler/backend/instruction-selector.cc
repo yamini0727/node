@@ -1150,6 +1150,9 @@ void InstructionSelector::InitializeCallBuffer(Node* call, CallBuffer* buffer,
       buffer->pushed_nodes[stack_index] = param;
       pushed_count++;
     } else {
+      if (location.IsNullRegister()) {
+        EmitMoveFPRToParam(&op, location);
+      };
       buffer->instruction_args.push_back(op);
     }
   }
@@ -2010,10 +2013,6 @@ void InstructionSelector::VisitNode(Node* node) {
       return MarkAsSimd128(node), VisitF32x4Neg(node);
     case IrOpcode::kF32x4Sqrt:
       return MarkAsSimd128(node), VisitF32x4Sqrt(node);
-    case IrOpcode::kF32x4RecipApprox:
-      return MarkAsSimd128(node), VisitF32x4RecipApprox(node);
-    case IrOpcode::kF32x4RecipSqrtApprox:
-      return MarkAsSimd128(node), VisitF32x4RecipSqrtApprox(node);
     case IrOpcode::kF32x4Add:
       return MarkAsSimd128(node), VisitF32x4Add(node);
     case IrOpcode::kF32x4Sub:
@@ -2836,14 +2835,18 @@ void InstructionSelector::VisitFinishRegion(Node* node) { EmitIdentity(node); }
 void InstructionSelector::VisitParameter(Node* node) {
   OperandGenerator g(this);
   int index = ParameterIndexOf(node->op());
-  InstructionOperand op =
-      linkage()->ParameterHasSecondaryLocation(index)
-          ? g.DefineAsDualLocation(
-                node, linkage()->GetParameterLocation(index),
-                linkage()->GetParameterSecondaryLocation(index))
-          : g.DefineAsLocation(node, linkage()->GetParameterLocation(index));
 
-  Emit(kArchNop, op);
+  if (linkage()->GetParameterLocation(index).IsNullRegister()) {
+    EmitMoveParamToFPR(node, index);
+  } else {
+    InstructionOperand op =
+        linkage()->ParameterHasSecondaryLocation(index)
+            ? g.DefineAsDualLocation(
+                  node, linkage()->GetParameterLocation(index),
+                  linkage()->GetParameterSecondaryLocation(index))
+            : g.DefineAsLocation(node, linkage()->GetParameterLocation(index));
+    Emit(kArchNop, op);
+  }
 }
 
 namespace {
@@ -3292,7 +3295,7 @@ FrameStateDescriptor* GetFrameStateDescriptorInternal(Zone* zone,
   const FrameStateInfo& state_info = FrameStateInfoOf(state->op());
   int parameters = state_info.parameter_count();
   int locals = state_info.local_count();
-  int stack = state_info.type() == FrameStateType::kUnoptimizedFunction ? 1 : 0;
+  int stack = state_info.stack_count();
 
   FrameStateDescriptor* outer_state = nullptr;
   if (state.outer_frame_state()->opcode() == IrOpcode::kFrameState) {

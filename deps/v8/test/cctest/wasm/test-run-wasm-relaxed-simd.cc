@@ -31,6 +31,11 @@ namespace test_run_wasm_relaxed_simd {
     EXPERIMENTAL_FLAG_SCOPE(relaxed_simd);                      \
     RunWasm_##name##_Impl(TestExecutionTier::kInterpreter);     \
   }                                                             \
+  TEST(RunWasm_##name##_liftoff) {                              \
+    EXPERIMENTAL_FLAG_SCOPE(relaxed_simd);                      \
+    FLAG_SCOPE(liftoff_only);                                   \
+    RunWasm_##name##_Impl(TestExecutionTier::kLiftoff);         \
+  }                                                             \
   void RunWasm_##name##_Impl(TestExecutionTier execution_tier)
 
 #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_S390X || \
@@ -223,16 +228,6 @@ WASM_RELAXED_SIMD_TEST(F64x2Qfms) {
 }
 #endif  // V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64 || V8_TARGET_ARCH_S390X ||
         // V8_TARGET_ARCH_PPC64 || V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_RISCV64
-
-WASM_RELAXED_SIMD_TEST(F32x4RecipApprox) {
-  RunF32x4UnOpTest(execution_tier, kExprF32x4RecipApprox, base::Recip,
-                   false /* !exact */);
-}
-
-WASM_RELAXED_SIMD_TEST(F32x4RecipSqrtApprox) {
-  RunF32x4UnOpTest(execution_tier, kExprF32x4RecipSqrtApprox, base::RecipSqrt,
-                   false /* !exact */);
-}
 
 #if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_IA32 || V8_TARGET_ARCH_ARM64 || \
     V8_TARGET_ARCH_ARM || V8_TARGET_ARCH_RISCV64
