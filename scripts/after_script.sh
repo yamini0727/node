@@ -3,7 +3,7 @@ set -x
 chown -R ubuntu:ubuntu /home/ubuntu/sample-nodejs/
 echo  "***Installing npm package ***" >> /tmp/samplenode-api-prod_deploy_logs
 echo >> /tmp/sample-nodejs-api-prod_deploys_logs
-#runuser -l ubuntu -c 'cd /home/ubuntu/(sample-nodejs) && npm install'
+#runuser -l ubuntu -c 'cd /home/ubuntu/(sample-nodejs) && npm install'.
 #runuser -l ubuntu -c 'cd /home/ubuntu/(sample-nodejs) && npm install --unsafe-perm'
 #runuser -l ubuntu -c 'cd /home/ubuntu/(sample-nodejs) && npm run build'
 sleep 10
