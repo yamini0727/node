@@ -1,6 +1,6 @@
 #!/bin/bash
 set -x
-echo "** (sample-nodejs)-api-prod process status **" >> /tmp/(samplenodejs)-api-prod_deploy_logs
+echo "** (sample-nodejs)-api-prod process status **" >> /tmp/(sample-nodejs)-api-prod_deploy_logs
 runuser -l ubuntu -c 'sudo pm2 status' | grep -wo nodejs
 if [  $? -ne 0 ];
 then
